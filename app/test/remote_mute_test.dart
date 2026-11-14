@@ -93,15 +93,28 @@ void main() {
   });
 
   group('allowing other riders to unmute', () {
-    test('is on for a fresh install', () {
+    test('is off for a fresh install', () {
+      // A mute request carries no credential, so opening somebody's
+      // microphone is opt-in.
       final state = AppState();
       addTearDown(state.dispose);
-      expect(state.allowRemoteUnmute, isTrue);
+      expect(state.allowRemoteUnmute, isFalse);
     });
 
-    test('turning it off is remembered', () async {
+    test('turning it on is remembered', () async {
       final state = AppState();
       addTearDown(state.dispose);
+      await state.setAllowRemoteUnmuteEnabled(value: true);
+
+      expect(state.allowRemoteUnmute, isTrue);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getBool('mumbleway.allowRemoteUnmute'), isTrue);
+    });
+
+    test('turning it off again is remembered', () async {
+      final state = AppState();
+      addTearDown(state.dispose);
+      await state.setAllowRemoteUnmuteEnabled(value: true);
       await state.setAllowRemoteUnmuteEnabled(value: false);
 
       expect(state.allowRemoteUnmute, isFalse);

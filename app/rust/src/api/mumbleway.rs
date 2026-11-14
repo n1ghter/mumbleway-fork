@@ -768,8 +768,11 @@ struct App {
     last_status: Arc<Mutex<HashMap<String, ConnStatus>>>,
     identity: Identity,
     /// Whether another MumbleWay rider may turn this rider's microphone on.
-    /// A setting, on by default; see `set_allow_remote_unmute`.
+    /// A setting, off by default; see `set_allow_remote_unmute`.
     allow_remote_unmute: Arc<AtomicBool>,
+    /// Told about the rider's own mute changes, so a remote mute the rider has
+    /// since undone by hand can no longer be undone by whoever sent it.
+    remote_mute_guard: Arc<Mutex<RemoteMuteGuard>>,
 }
 
 /// Decides which audio cue, if any, a status transition should play.
@@ -995,15 +998,16 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
     let cue_shared = shared.clone();
     let last_status: Arc<Mutex<HashMap<String, ConnStatus>>> = Arc::new(Mutex::new(HashMap::new()));
     let status_tracker = last_status.clone();
-    // On by default, and overwritten from the saved setting as soon as Dart has
-    // read it. Default-on is the setting's own default, so the brief window
-    // before that write cannot do anything the rider has not left enabled.
-    let allow_remote_unmute = Arc::new(AtomicBool::new(true));
+    // Off by default, and overwritten from the saved setting as soon as Dart
+    // has read it. Default-off is the setting's own default, so the brief
+    // window before that write cannot do anything the rider has not enabled.
+    let allow_remote_unmute = Arc::new(AtomicBool::new(false));
     let allow_unmute_task = allow_remote_unmute.clone();
     // One guard for the whole app, not one per server: a rider on two servers
     // at once still gets one cooldown, and nobody gets round it by asking from
     // the other one.
-    let remote_mute_guard = Mutex::new(RemoteMuteGuard::default());
+    let remote_mute_guard = Arc::new(Mutex::new(RemoteMuteGuard::default()));
+    let remote_mute_local = remote_mute_guard.clone();
     // Every server's bandwidth allowance, by server. One encoder feeds them
     // all, so what it is set to is decided by the *tightest* of these — see
     // `audio::bandwidth::tightest`.
@@ -1321,10 +1325,19 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
                     // where all three inputs meet: the microphone's real state,
                     // the rider's setting, and a cooldown that has to hold
                     // across every server.
+                    //
+                    // The sender is named per server: the same display name on
+                    // another server is somebody else.
+                    let from = if by.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{server_id}\u{0}{by}")
+                    };
                     let decision = remote_mute_guard.lock().decide(
                         mute,
                         cue_shared.is_muted(),
                         allow_unmute_task.load(Ordering::Relaxed),
+                        &from,
                         now(),
                     );
                     match decision {
@@ -1531,6 +1544,7 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
         last_status,
         identity,
         allow_remote_unmute,
+        remote_mute_guard: remote_mute_local,
     });
     Ok(())
 }
@@ -1958,7 +1972,9 @@ pub fn remove_server(server_id: String) -> anyhow::Result<()> {
 /// Mutes or unmutes the local microphone.
 #[frb(sync)]
 pub fn set_microphone_muted(muted: bool) -> anyhow::Result<()> {
-    app()?.shared.set_muted(muted);
+    let app = app()?;
+    app.shared.set_muted(muted);
+    app.remote_mute_guard.lock().note_local(muted);
     Ok(())
 }
 

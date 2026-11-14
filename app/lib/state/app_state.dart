@@ -1341,7 +1341,7 @@ class AppState extends ChangeNotifier {
     // On by default; see the field. A rider who has already chosen keeps
     // their choice — this only decides what a fresh install starts with.
     voiceCommunication = prefs.getBool(_prefsVoiceCommunication) ?? true;
-    allowRemoteUnmute = prefs.getBool(_prefsAllowRemoteUnmute) ?? true;
+    allowRemoteUnmute = prefs.getBool(_prefsAllowRemoteUnmute) ?? false;
     _loadReviewCounters(prefs);
     // The rider's own picture, from this device. Read off the disk rather
     // than out of preferences, so this settles a moment later and does not
@@ -4008,12 +4008,14 @@ class AppState extends ChangeNotifier {
 
   /// Whether another MumbleWay rider may turn our microphone back on.
   ///
-  /// On by default, and only unmuting is governed by it: being muted by
+  /// Off by default, and only unmuting is governed by it: being muted by
   /// somebody costs a rider nothing their own button cannot undo, while being
-  /// unmuted puts them on air. The reason it is on is the rider who muted to
-  /// take a call and forgot, and is now talking to a channel that hears
-  /// nothing. The core holds the live copy; see `set_allow_remote_unmute`.
-  bool allowRemoteUnmute = true;
+  /// unmuted puts them on air. It is off because the request carries no
+  /// credential — any client on the server can claim to run MumbleWay and ask.
+  /// Whoever muted the rider can still undo that one mute without it; see
+  /// `REMOTE_UNDO_WINDOW`. The core holds the live copy; see
+  /// `set_allow_remote_unmute`.
+  bool allowRemoteUnmute = false;
 
   /// Launches and completed calls since the last time we asked for a review.
   ///

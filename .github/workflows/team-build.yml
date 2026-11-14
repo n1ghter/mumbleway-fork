@@ -1,7 +1,7 @@
 name: team-build
 
 # Field-test builds for a riding group, from the fork's `team-build` branch:
-# every open fix merged together, built for Android and Windows, and put on a
+# every open fix merged together, built for Android, Windows and macOS, and put on a
 # pre-release so testers download by link without a GitHub account.
 #
 # Nothing here uploads to a store, and nothing runs on `main` — `build.yml` and
@@ -98,6 +98,48 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
+      # **Build from a short path.** The fork's checkout, `D:\a\mumbleway-fork\
+      # mumbleway-fork`, is ten characters longer than upstream's, and that was
+      # enough: the CMake compiler probe libopus runs inside cargokit's build
+      # directory went past MAX_PATH and cl.exe failed with C1083 "Cannot open
+      # compiler generated file: '': Invalid argument". A copy at `C:\mw` puts
+      # every path back under the limit.
+      - name: Copy the tree to a short path
+        run: |
+          robocopy $env:GITHUB_WORKSPACE C:\mw /E /XD .git /NFL /NDL /NJH /NJS /NP
+          if ($LASTEXITCODE -ge 8) { exit $LASTEXITCODE }
+          exit 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Ninja
+        run: choco install ninja -y --no-progress
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Build
+        working-directory: C:\mw\app
+        run: |
+          flutter pub get
+          flutter build windows --release
+      - name: Package
+        working-directory: C:\mw\app\build\windows\x64\runner\Release
+        run: 7z a -tzip "$env:GITHUB_WORKSPACE\mumbleway-team-windows-x64.zip" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mumbleway-team-windows
+          path: mumbleway-team-windows-x64.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -105,12 +147,6 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Ninja
-        run: choco install ninja -y --no-progress
-      - uses: ilammy/msvc-dev-cmd@v1
-      - name: Build engine
-        working-directory: app/rust
-        run: cargo build --release
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
@@ -120,19 +156,19 @@ jobs:
         working-directory: app
         run: |
           flutter pub get
-          flutter build windows --release
+          flutter build macos --release
       - name: Package
-        working-directory: app/build/windows/x64/runner/Release
-        run: 7z a -tzip ../../../../../../mumbleway-team-windows-x64.zip .
+        working-directory: app/build/macos/Build/Products/Release
+        run: ditto -c -k --sequesterRsrc --keepParent mumbleway.app "$GITHUB_WORKSPACE/mumbleway-team-macos.zip"
       - uses: actions/upload-artifact@v4
         with:
-          name: mumbleway-team-windows
-          path: mumbleway-team-windows-x64.zip
+          name: mumbleway-team-macos
+          path: mumbleway-team-macos.zip
           if-no-files-found: error
 
   release:
     name: Pre-release
-    needs: [android, windows]
+    needs: [android, windows, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -152,7 +188,9 @@ jobs:
             Test build for field testing, from branch `team-build` at ${{ github.sha }}.
             Not a release. Android: install `mumbleway-team.apk` (installs beside the store app).
             Windows: unzip and run `mumbleway.exe`.
+            macOS: unzip, then `xattr -cr mumbleway.app` once (the build is not notarised).
           files: |
             dist/mumbleway-team.apk
             dist/mumbleway-team-windows-x64.zip
+            dist/mumbleway-team-macos.zip
           fail_on_unmatched_files: true

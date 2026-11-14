@@ -1,0 +1,158 @@
+name: team-build
+
+# Field-test builds for a riding group, from the fork's `team-build` branch:
+# every open fix merged together, built for Android and Windows, and put on a
+# pre-release so testers download by link without a GitHub account.
+#
+# Nothing here uploads to a store, and nothing runs on `main` — `build.yml` and
+# `publish.yml` are untouched and keep their own triggers. The steps are the
+# ones `build.yml` uses for the same platforms; read the comments there.
+
+on:
+  push:
+    branches: [team-build]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: '3.44.8'
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    env:
+      # Gives the APK the id `com.mumbleway.mumbleway.team`, so it installs
+      # beside a store build instead of failing over the signature.
+      MUMBLEWAY_TEAM_BUILD: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'app/rust -> target'
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      # **One debug key across runs.** With no upload key the release APK is
+      # debug-signed, and a fresh runner makes a fresh debug key — so every
+      # build would refuse to install over the last one until the tester
+      # uninstalled, losing their servers. The cache keeps the key stable for as
+      # long as it is used at least once a week.
+      - name: Keep the signing key between builds
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: team-build-debug-keystore-v1
+
+      - name: Add Android Rust targets
+        run: rustup target add aarch64-linux-android armv7-linux-androideabi
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Build APK
+        working-directory: app
+        run: |
+          flutter pub get
+          # One universal APK for both phone ABIs, so testers pick no file.
+          # SEVERE means the Rust library did not build and a stale one was
+          # packaged — see build.yml and CLAUDE.md.
+          flutter build apk --release --target-platform android-arm,android-arm64 2>&1 | tee build.log
+          if grep -q 'SEVERE' build.log; then
+            echo '::error::cargokit reported SEVERE'
+            grep -n 'SEVERE' build.log | head -20
+            exit 1
+          fi
+          cp build/app/outputs/flutter-apk/app-release.apk ../mumbleway-team.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mumbleway-team-android
+          path: mumbleway-team.apk
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'app/rust -> target'
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Ninja
+        run: choco install ninja -y --no-progress
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Build engine
+        working-directory: app/rust
+        run: cargo build --release
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Build
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter build windows --release
+      - name: Package
+        working-directory: app/build/windows/x64/runner/Release
+        run: 7z a -tzip ../../../../../../mumbleway-team-windows-x64.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mumbleway-team-windows
+          path: mumbleway-team-windows-x64.zip
+          if-no-files-found: error
+
+  release:
+    name: Pre-release
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # A `team-` tag, never `v*`: `publish.yml` runs on `v*` and uploads to
+      # the stores.
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: team-build-${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: Team test build ${{ github.run_number }}
+          prerelease: true
+          make_latest: false
+          body: |
+            Test build for field testing, from branch `team-build` at ${{ github.sha }}.
+            Not a release. Android: install `mumbleway-team.apk` (installs beside the store app).
+            Windows: unzip and run `mumbleway.exe`.
+          files: |
+            dist/mumbleway-team.apk
+            dist/mumbleway-team-windows-x64.zip
+          fail_on_unmatched_files: true

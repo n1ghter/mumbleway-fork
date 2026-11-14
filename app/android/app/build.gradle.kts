@@ -110,6 +110,14 @@ android {
             versionNameSuffix = "-dev"
         }
         release {
+            // **The team field-test build installs beside the store one.** The
+            // fork's `team-build.yml` sets this so a rider can carry both apps:
+            // a debug-signed release cannot install over a Play build, and
+            // uninstalling to test would wipe their servers and settings.
+            if (System.getenv("MUMBLEWAY_TEAM_BUILD") == "1") {
+                applicationIdSuffix = ".team"
+                versionNameSuffix = "-team"
+            }
             // Debug keys when no upload key is configured, so `flutter run
             // --release` still works for a developer who has none. Play will
             // reject a debug-signed bundle, which is the correct outcome: a

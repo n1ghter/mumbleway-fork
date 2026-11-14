@@ -1,7 +1,7 @@
 # cargo-deny, for both crates: `core/` and `app/rust/`. Run by the `deny` job
 # in build.yml, and locally with
 #
-#   cargo deny --manifest-path core/Cargo.toml check --config deny.toml
+#   cargo deny --manifest-path core/Cargo.toml --config deny.toml check
 #
 # `tools/*` are benchmark harnesses that ship in no build, and are left out.
 

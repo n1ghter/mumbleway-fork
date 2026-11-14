@@ -212,7 +212,7 @@ jobs:
         run: |
           for crate in core app/rust; do
             echo "::group::$crate"
-            cargo deny --manifest-path "$crate/Cargo.toml" check --config deny.toml licenses bans sources
+            cargo deny --manifest-path "$crate/Cargo.toml" --config deny.toml check licenses bans sources
             echo "::endgroup::"
           done
 
@@ -222,7 +222,7 @@ jobs:
           status=0
           for crate in core app/rust; do
             echo "::group::$crate"
-            cargo deny --manifest-path "$crate/Cargo.toml" check --config deny.toml advisories || status=1
+            cargo deny --manifest-path "$crate/Cargo.toml" --config deny.toml check advisories || status=1
             echo "::endgroup::"
           done
           [ $status -eq 0 ] || echo "::warning::cargo-deny found advisories; see the log above"

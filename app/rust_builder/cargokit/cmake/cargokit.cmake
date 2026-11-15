@@ -26,6 +26,17 @@ function(apply_cargokit target manifest_dir lib_name any_symbol_name)
         set(OUTPUT_LIB "${CMAKE_CURRENT_BINARY_DIR}/${CARGOKIT_LIB_FULL_NAME}")
     endif()
     set(CARGOKIT_TEMP_DIR "${CMAKE_CURRENT_BINARY_DIR}/cargokit_build")
+    if (WIN32 AND DEFINED ENV{LOCALAPPDATA})
+        # MumbleWay: keep the cargo target dir on a short path. Under the
+        # Flutter build tree it is ~70 characters deep before cargo adds its
+        # own layers, and audiopus_sys's nested CMake compiler probe then
+        # exceeds MAX_PATH. cl.exe ignores LongPathsEnabled and fails with
+        # C1083 "Cannot open compiler generated file: ''". The hash keeps
+        # separate checkouts from sharing one target dir.
+        string(MD5 _cargokit_hash "${CMAKE_CURRENT_BINARY_DIR}")
+        string(SUBSTRING "${_cargokit_hash}" 0 8 _cargokit_hash)
+        file(TO_CMAKE_PATH "$ENV{LOCALAPPDATA}/cargokit/${_cargokit_hash}" CARGOKIT_TEMP_DIR)
+    endif()
 
     if (FLUTTER_TARGET_PLATFORM)
         set(CARGOKIT_TARGET_PLATFORM "${FLUTTER_TARGET_PLATFORM}")

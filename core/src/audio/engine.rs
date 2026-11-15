@@ -4730,9 +4730,8 @@ mod tests {
     #[test]
     fn auto_follows_the_link_and_fixed_ignores_it() {
         let lossy = LinkReport {
-            loss_up: 0.2,
-            ping_ms: 50.0,
-            tunnelled: false,
+            loss_up: Some(0.2),
+            ..Default::default()
         };
         let shared = AudioShared::new();
         shared.set_bitrate_mode(BitrateMode::Auto);

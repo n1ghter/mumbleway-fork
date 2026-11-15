@@ -18,7 +18,7 @@ use mumbleway_core::audio::engine::{
     AudioConfig, AudioCue, AudioEngine, AudioShared, TransmitMode,
 };
 use mumbleway_core::audio::feedback::FeedbackMode;
-use mumbleway_core::audio::{BitrateMode, LinkReport, NoiseProfile, Quality};
+use mumbleway_core::audio::{BitrateMode, LinkReport, LinkTracker, NoiseProfile, Quality};
 use mumbleway_core::diag::{self, LogEntry, LogLevel};
 use mumbleway_core::net::tls::Identity;
 use mumbleway_core::session::manager::{SessionManager, TaggedEvent};
@@ -1009,11 +1009,12 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
     // `audio::bandwidth::tightest`.
     let bandwidth_caps: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::new());
     let bandwidth_shared = shared.clone();
-    // Each server's account of our own outgoing link, and which session is
-    // ours there. "Auto" bitrate fits the worst of them, for the same reason
-    // the cap is the tightest — see `audio::adaptive`.
+    // Which session is ours on each server, and what each server's figures say
+    // about our own outgoing link. "Auto" bitrate takes evidence from all of
+    // them, so the worst link decides, for the same reason the cap is the
+    // tightest — see `audio::adaptive`.
     let mut own_sessions: HashMap<String, u32> = HashMap::new();
-    let mut own_links: HashMap<String, LinkReport> = HashMap::new();
+    let mut own_links: HashMap<String, LinkTracker> = HashMap::new();
 
     rt.spawn(async move {
         // Owned by this task, which is the only place either kind of mute cue
@@ -1057,62 +1058,66 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
                     emit(AppEvent::Status(u));
                 }
                 SessionEvent::Users(users) => {
-                    // The server measures our own connection like everybody
-                    // else's; that is the one figure about our *outgoing*
-                    // voice, and it is what "Auto" listens to.
+                    // The server counts our own packets like everybody else's;
+                    // that is the one figure about our *outgoing* voice. The
+                    // tracker turns the counts since connecting into the loss
+                    // of the last few seconds — the rolling ratio on the row is
+                    // five minutes long and would hold "Auto" down for all of it.
                     let own = own_sessions.get(&server_id).copied();
                     if let Some(q) = users
                         .iter()
                         .find(|u| Some(u.session) == own)
                         .and_then(|u| u.quality)
                     {
-                        own_links.insert(
-                            server_id.clone(),
-                            LinkReport {
-                                loss_up: q.loss_up,
-                                ping_ms: q.ping_ms,
-                                tunnelled: !q.udp,
-                            },
-                        );
-                        if let Some(worst) = own_links.values().copied().reduce(LinkReport::worst) {
-                            bandwidth_shared.report_link(worst);
+                        let t = q.up_total;
+                        let loss = own_links
+                            .entry(server_id.clone())
+                            .or_default()
+                            .on_totals(t.good.saturating_add(t.late), t.lost);
+                        if let Some(loss) = loss {
+                            let tunnelled = own_links.values().any(|l| l.tunnelled);
+                            bandwidth_shared.report_link(LinkReport {
+                                loss_up: Some(loss),
+                                queue_ms: None,
+                                tunnelled,
+                            });
                         }
                     }
                     emit(AppEvent::Users {
-                    server_id,
-                    users: users
-                        .into_iter()
-                        .map(|u| {
-                            // Derive the label before moving any fields out.
-                            let status = u.status_label().to_string();
-                            UiUser {
-                                session: u.session,
-                                name: u.name,
-                                channel_id: u.channel_id,
-                                talking: u.talking,
-                                muted: u.mute,
-                                deafened: u.deaf,
-                                self_muted: u.self_mute,
-                                self_deafened: u.self_deaf,
-                                local_mute: u.local_mute,
-                                user_id: u.user_id,
-                                muted_you: u.muted_you,
-                                status,
-                                mumbleway_version: u.mumbleway,
-                                priority_speaker: u.priority_speaker,
-                                suppressed: u.suppress,
-                                comment: u.comment,
-                                quality: u.quality.map(|q| UiQuality {
-                                    ping_ms: q.ping_ms,
-                                    udp: q.udp,
-                                    loss_up: q.loss_up,
-                                    loss_down: q.loss_down,
-                                    window_secs: q.window_secs,
-                                    idle_secs: q.idle_secs,
-                                }),
-                            }
-                        })
-                        .collect(),
+                        server_id,
+                        users: users
+                            .into_iter()
+                            .map(|u| {
+                                // Derive the label before moving any fields out.
+                                let status = u.status_label().to_string();
+                                UiUser {
+                                    session: u.session,
+                                    name: u.name,
+                                    channel_id: u.channel_id,
+                                    talking: u.talking,
+                                    muted: u.mute,
+                                    deafened: u.deaf,
+                                    self_muted: u.self_mute,
+                                    self_deafened: u.self_deaf,
+                                    local_mute: u.local_mute,
+                                    user_id: u.user_id,
+                                    muted_you: u.muted_you,
+                                    status,
+                                    mumbleway_version: u.mumbleway,
+                                    priority_speaker: u.priority_speaker,
+                                    suppressed: u.suppress,
+                                    comment: u.comment,
+                                    quality: u.quality.map(|q| UiQuality {
+                                        ping_ms: q.ping_ms,
+                                        udp: q.udp,
+                                        loss_up: q.loss_up,
+                                        loss_down: q.loss_down,
+                                        window_secs: q.window_secs,
+                                        idle_secs: q.idle_secs,
+                                    }),
+                                }
+                            })
+                            .collect(),
                     });
                 }
                 SessionEvent::Channels(chans) => emit(AppEvent::Channels {
@@ -1139,15 +1144,31 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
                     reason,
                     kind,
                 }),
-                SessionEvent::Stats(s) => emit(AppEvent::Stats(UiStats {
-                    server_id,
-                    tcp_ping_ms: s.tcp_ping_ms,
-                    udp_ping_ms: s.udp_ping_ms,
-                    transport: match s.transport {
-                        Some(TransportStat::Udp) => "udp".to_string(),
-                        _ => "tcp".to_string(),
-                    },
-                })),
+                SessionEvent::Stats(s) => {
+                    // Our latest round trip, for "Auto"'s queueing delay. Not
+                    // the ping on our own roster row: that is the mean over the
+                    // whole session, and barely moves for a bad minute.
+                    let tracker = own_links.entry(server_id.clone()).or_default();
+                    tracker.tunnelled = matches!(s.transport, Some(TransportStat::TcpTunnel));
+                    let queue = tracker.on_rtt(now(), s.udp_ping_ms);
+                    let tunnelled = own_links.values().any(|l| l.tunnelled);
+                    if queue.is_some() || tunnelled {
+                        bandwidth_shared.report_link(LinkReport {
+                            loss_up: None,
+                            queue_ms: queue,
+                            tunnelled,
+                        });
+                    }
+                    emit(AppEvent::Stats(UiStats {
+                        server_id,
+                        tcp_ping_ms: s.tcp_ping_ms,
+                        udp_ping_ms: s.udp_ping_ms,
+                        transport: match s.transport {
+                            Some(TransportStat::Udp) => "udp".to_string(),
+                            _ => "tcp".to_string(),
+                        },
+                    }));
+                }
                 SessionEvent::TransportChanged(t) => emit(AppEvent::Stats(UiStats {
                     server_id,
                     tcp_ping_ms: 0.0,

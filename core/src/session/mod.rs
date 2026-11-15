@@ -1605,9 +1605,12 @@ impl Session {
             MessageType::UserStats => {
                 let m = mumble::UserStats::decode(payload)?;
                 if let Some(session) = m.session {
-                    // Rolling first: a minute of loss is what "how is this
-                    // connection now" means, and the count since they connected
+                    // Rolling first: the server's window (300 s on the servers
+                    // seen so far) is what "how is this connection now" means
+                    // on a roster row, and the count since they connected
                     // keeps reporting a bad bridge an hour after it.
+                    // The cumulative count is kept as well, raw, for whatever
+                    // needs the last few seconds — see `Quality::up_total`.
                     let rolling = m.rolling_stats.as_ref();
                     let window = rolling.and_then(|r| r.time_window).unwrap_or(0);
                     let counts = |s: &mumble::user_stats::Stats| quality::Counts {
@@ -1648,18 +1651,17 @@ impl Session {
                         }))
                         .await;
                     }
-                    state.quality.insert(
+                    let mut q = quality::Quality::from_stats(
                         session,
-                        quality::Quality::from_stats(
-                            session,
-                            m.udp_ping_avg,
-                            m.tcp_ping_avg,
-                            up,
-                            down,
-                            window,
-                            m.idlesecs.unwrap_or(0),
-                        ),
+                        m.udp_ping_avg,
+                        m.tcp_ping_avg,
+                        up,
+                        down,
+                        window,
+                        m.idlesecs.unwrap_or(0),
                     );
+                    q.up_total = m.from_client.as_ref().map(counts).unwrap_or_default();
+                    state.quality.insert(session, q);
                     state.quality_fresh = true;
                 }
             }

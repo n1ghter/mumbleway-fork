@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../l10n/app_localizations.dart';
+import '../services/device_identity.dart';
 import '../services/server_proxy.dart';
 import '../src/rust/api/mumbleway.dart';
 import '../state/app_state.dart';
@@ -333,6 +334,24 @@ class _AddServerScreenState extends State<AddServerScreen> {
               ),
               validator: (v) =>
                   (v == null || v.trim().isEmpty) ? l.usernameMissing : null,
+            ),
+            // Said under the field rather than in it: the device had no usable
+            // name (a Windows login of "User", an iPhone called "iPhone"), so
+            // this one is made up and the rider should know to replace it.
+            ValueListenableBuilder<TextEditingValue>(
+              valueListenable: _user,
+              builder: (context, value, _) =>
+                  DeviceIdentity.isGenerated(value.text)
+                  ? Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+                      child: Text(
+                        l.usernameGenerated,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: Theme.of(context).colorScheme.tertiary,
+                        ),
+                      ),
+                    )
+                  : const SizedBox.shrink(),
             ),
             const SizedBox(height: 12),
             TextFormField(

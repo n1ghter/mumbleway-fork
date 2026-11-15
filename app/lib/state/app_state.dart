@@ -647,6 +647,7 @@ class AppState extends ChangeNotifier {
   static const _prefsButtons = 'mumbleway.buttonBindings';
   static const _prefsCloudSync = 'mumbleway.cloudSync';
   static const _prefsFloatingWindow = 'mumbleway.floatingWindow';
+  static const _prefsOverlayAsked = 'mumbleway.floatingWindowAsked';
   static const _prefsDeleted = 'mumbleway.deletedServers';
   static const _prefsSuggestedName = 'mumbleway.suggestedName';
 
@@ -1305,7 +1306,7 @@ class AppState extends ChangeNotifier {
       // grant in system settings. A failure there leaves the setting off
       // without an alarm rather than blocking a startup that is otherwise fine.
       if (_wantOverlay && overlay.isSupported) {
-        unawaited(enableOverlay());
+        unawaited(_restoreOverlay());
       }
 
       _resumeProbing();
@@ -4807,6 +4808,39 @@ class AppState extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_prefsReviewDone, true);
     return StoreLinks.review();
+  }
+
+  /// Puts the floating window back at launch, asking for its permission at
+  /// most once in the app's life.
+  ///
+  /// Android grants "display over other apps" only on its own settings page,
+  /// so asking means throwing the rider out of the app. Doing that on every
+  /// launch until they gave in was the single most complained-about thing in
+  /// the app: a rider who does not want the window was sent to Settings each
+  /// time they opened it. So launch asks once; after that, a missing
+  /// permission just leaves the window off, and the switch in Settings —
+  /// which calls [enableOverlay] directly — is where it gets asked for again.
+  Future<void> _restoreOverlay() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!await mayAskForOverlayAtLaunch(prefs, overlay.hasPermission)) return;
+    await enableOverlay();
+  }
+
+  /// Whether this launch may go on to [enableOverlay], which opens the
+  /// system settings page when the permission is missing.
+  ///
+  /// True when the permission is already there, since nothing is asked then.
+  /// Otherwise true only the first time, and the asking is recorded before it
+  /// happens: a launch that dies on the settings page must not ask again.
+  @visibleForTesting
+  static Future<bool> mayAskForOverlayAtLaunch(
+    SharedPreferences prefs,
+    Future<bool> Function() hasPermission,
+  ) async {
+    if (await hasPermission()) return true;
+    if (prefs.getBool(_prefsOverlayAsked) ?? false) return false;
+    await prefs.setBool(_prefsOverlayAsked, true);
+    return true;
   }
 
   void _syncOverlayToCalls() {

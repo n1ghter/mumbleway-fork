@@ -18,7 +18,7 @@ use mumbleway_core::audio::engine::{
     AudioConfig, AudioCue, AudioEngine, AudioShared, TransmitMode,
 };
 use mumbleway_core::audio::feedback::FeedbackMode;
-use mumbleway_core::audio::{NoiseProfile, Quality};
+use mumbleway_core::audio::{BitrateMode, LinkReport, NoiseProfile, Quality};
 use mumbleway_core::diag::{self, LogEntry, LogLevel};
 use mumbleway_core::net::tls::Identity;
 use mumbleway_core::session::manager::{SessionManager, TaggedEvent};
@@ -1009,6 +1009,11 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
     // `audio::bandwidth::tightest`.
     let bandwidth_caps: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::new());
     let bandwidth_shared = shared.clone();
+    // Each server's account of our own outgoing link, and which session is
+    // ours there. "Auto" bitrate fits the worst of them, for the same reason
+    // the cap is the tightest — see `audio::adaptive`.
+    let mut own_sessions: HashMap<String, u32> = HashMap::new();
+    let mut own_links: HashMap<String, LinkReport> = HashMap::new();
 
     rt.spawn(async move {
         // Owned by this task, which is the only place either kind of mute cue
@@ -1040,6 +1045,8 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
                             )
                         };
                         bandwidth_shared.set_bandwidth_cap(tightest.unwrap_or(0));
+                        own_sessions.remove(&server_id);
+                        own_links.remove(&server_id);
                     }
 
                     let previous = status_tracker.lock().insert(server_id, u.status);
@@ -1049,7 +1056,29 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
 
                     emit(AppEvent::Status(u));
                 }
-                SessionEvent::Users(users) => emit(AppEvent::Users {
+                SessionEvent::Users(users) => {
+                    // The server measures our own connection like everybody
+                    // else's; that is the one figure about our *outgoing*
+                    // voice, and it is what "Auto" listens to.
+                    let own = own_sessions.get(&server_id).copied();
+                    if let Some(q) = users
+                        .iter()
+                        .find(|u| Some(u.session) == own)
+                        .and_then(|u| u.quality)
+                    {
+                        own_links.insert(
+                            server_id.clone(),
+                            LinkReport {
+                                loss_up: q.loss_up,
+                                ping_ms: q.ping_ms,
+                                tunnelled: !q.udp,
+                            },
+                        );
+                        if let Some(worst) = own_links.values().copied().reduce(LinkReport::worst) {
+                            bandwidth_shared.report_link(worst);
+                        }
+                    }
+                    emit(AppEvent::Users {
                     server_id,
                     users: users
                         .into_iter()
@@ -1084,7 +1113,8 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
                             }
                         })
                         .collect(),
-                }),
+                    });
+                }
                 SessionEvent::Channels(chans) => emit(AppEvent::Channels {
                     server_id,
                     channels: chans
@@ -1137,6 +1167,7 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
                 }),
                 SessionEvent::Welcome(text) => emit(AppEvent::Welcome { server_id, text }),
                 SessionEvent::SelfSession(session) => {
+                    own_sessions.insert(server_id.clone(), session);
                     emit(AppEvent::SelfSession { server_id, session })
                 }
                 SessionEvent::SelfSuppressed(suppressed) => {
@@ -3403,6 +3434,43 @@ pub fn jitter_buffer_bounds_ms() -> (u32, u32, u32) {
         (mumbleway_core::audio::MAX_TARGET_FRAMES * 20) as u32,
         20,
     )
+}
+
+/// Sets the voice bitrate: `0` for "Auto", which follows our own link as the
+/// server measures it, or a fixed number of bits per second, snapped to the
+/// range [`voice_bitrate_bounds_bps`] reports. A server's bandwidth allowance
+/// still applies on top of either.
+#[frb(sync)]
+pub fn set_voice_bitrate(bps: u32) -> anyhow::Result<()> {
+    let mode = if bps == 0 {
+        BitrateMode::Auto
+    } else {
+        BitrateMode::fixed(bps)
+    };
+    app()?.shared.set_bitrate_mode(mode);
+    Ok(())
+}
+
+/// The voice bitrate setting: `0` for "Auto", otherwise the fixed rate.
+#[frb(sync)]
+pub fn voice_bitrate_setting() -> anyhow::Result<u32> {
+    Ok(match app()?.shared.bitrate_mode() {
+        BitrateMode::Auto => 0,
+        BitrateMode::Fixed(bps) => bps,
+    })
+}
+
+/// What the encoder is sending right now, after "Auto" and any server cap.
+#[frb(sync)]
+pub fn voice_bitrate_now_bps() -> anyhow::Result<u32> {
+    Ok(app()?.shared.encoder_bitrate_bps())
+}
+
+/// The range a fixed bitrate may take, as `(minimum, maximum, step)` in bit/s.
+#[frb(sync)]
+pub fn voice_bitrate_bounds_bps() -> (u32, u32, u32) {
+    use mumbleway_core::audio::adaptive::{FIXED_MAX_BPS, FIXED_MIN_BPS, FIXED_STEP_BPS};
+    (FIXED_MIN_BPS, FIXED_MAX_BPS, FIXED_STEP_BPS)
 }
 
 /// Acoustic echo cancellation, applied to the microphone before anything else.

@@ -1,3 +1,4 @@
+// Run with `dart test -c source` on Dart 3.5+ (locked frontend_server_client 3.2.0 targets legacy JIT snapshot).
 import 'dart:io';
 
 import 'package:build_tool/src/builder.dart';

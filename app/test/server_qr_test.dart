@@ -1,7 +1,10 @@
+import 'dart:io' show Directory, File;
+import 'dart:typed_data' show Uint8List;
 import 'dart:ui' as ui;
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mumbleway/screens/server_qr_screen.dart';
+import 'package:share_plus/share_plus.dart';
 
 void main() {
   group('qrOffersSaveAs', () {
@@ -22,8 +25,23 @@ void main() {
 
   test('the file name is safe on every file system', () {
     expect(qrFileName('Obrezki'), 'Obrezki-qr.png');
-    expect(qrFileName('My: server/1?'), 'My__server_1_-qr.png');
-    expect(qrFileName('Сервер'), '______-qr.png');
+    expect(qrFileName('Сервер'), 'Сервер-qr.png');
+    expect(qrFileName('Мой сервер 1'), 'Мой_сервер_1-qr.png');
+    expect(qrFileName('My: server/1?'), 'My_server_1-qr.png');
+    expect(qrFileName(r'a<b>c:d"e/f\g|h?i*j'), 'a_b_c_d_e_f_g_h_i_j-qr.png');
+    expect(qrFileName('srv\x00\x1f\x7fname'), 'srv_name-qr.png');
+
+    for (final blank in const [
+      '',
+      '   ',
+      '...',
+      '___',
+      '---',
+      r'<>:"/\|?*',
+      '\x00\x1f\x7f',
+    ]) {
+      expect(qrFileName(blank), 'mumbleway-qr.png');
+    }
   });
 
   testWidgets('the picture is a square PNG on an opaque white field', (
@@ -45,6 +63,87 @@ void main() {
       // transparent black that disappears in a dark-themed messenger.
       expect(rgba.getUint32(0), 0xFFFFFFFF);
       image.dispose();
+    });
+  });
+
+  group('shareQrImageFile', () {
+    late Directory tempDir;
+
+    setUp(() => tempDir = Directory.systemTemp.createTempSync('mw-qr-share-'));
+    tearDown(() => tempDir.deleteSync(recursive: true));
+
+    test('deletes the temp file when share returns a definitive status', () async {
+      for (final status in const [
+        ShareResultStatus.success,
+        ShareResultStatus.dismissed,
+      ]) {
+        late String sharedPath;
+        String? sharedMime;
+        await shareQrImageFile(
+          dir: tempDir,
+          fileName: 'Srv-qr.png',
+          bytes: Uint8List.fromList([1, 2, 3]),
+          subject: 'Join me on Srv',
+          share: (params) async {
+            final xfile = params.files!.single;
+            sharedPath = xfile.path;
+            sharedMime = xfile.mimeType;
+            expect(File(sharedPath).existsSync(), isTrue);
+            expect(File(sharedPath).readAsBytesSync(), [1, 2, 3]);
+            return status;
+          },
+        );
+        expect(sharedMime, 'image/png');
+        expect(File(sharedPath).existsSync(), isFalse);
+      }
+    });
+
+    test('keeps the deterministic temp file on unavailable status', () async {
+      late String sharedPath;
+      await shareQrImageFile(
+        dir: tempDir,
+        fileName: 'Srv-qr.png',
+        bytes: Uint8List.fromList([1, 2, 3]),
+        subject: 'Join me on Srv',
+        share: (params) async {
+          sharedPath = params.files!.single.path;
+          return ShareResultStatus.unavailable;
+        },
+      );
+      expect(File(sharedPath).existsSync(), isTrue);
+      expect(File(sharedPath).readAsBytesSync(), [1, 2, 3]);
+
+      // Subsequent shares of the same server overwrite the kept file cleanly.
+      await shareQrImageFile(
+        dir: tempDir,
+        fileName: 'Srv-qr.png',
+        bytes: Uint8List.fromList([4, 5, 6]),
+        subject: 'Join me on Srv',
+        share: (_) async => ShareResultStatus.unavailable,
+      );
+      expect(File(sharedPath).readAsBytesSync(), [4, 5, 6]);
+    });
+
+    test('deletes the temp file and rethrows when share throws', () async {
+      late String sharedPath;
+      var threw = false;
+      try {
+        await shareQrImageFile(
+          dir: tempDir,
+          fileName: 'Srv-qr.png',
+          bytes: Uint8List.fromList([7, 8, 9]),
+          subject: 'Join me on Srv',
+          share: (params) async {
+            sharedPath = params.files!.single.path;
+            expect(File(sharedPath).existsSync(), isTrue);
+            throw UnimplementedError('no share sheet');
+          },
+        );
+      } on UnimplementedError {
+        threw = true;
+      }
+      expect(threw, isTrue);
+      expect(File(sharedPath).existsSync(), isFalse);
     });
   });
 }

@@ -456,7 +456,8 @@ impl RemoteMuteGuard {
     /// of refused unmutes would block the one mute request that was genuinely
     /// needed.
     ///
-    /// `from` names the sender, scoped to its server by the caller. Without
+    /// `from` identifies the sender (certificate hash or session key, scoped
+    /// to its server by the caller — never a mutable display name). Without
     /// `allow_unmute`, an unmute is still honoured from the rider who sent the
     /// mute now in force; see [`REMOTE_UNDO_WINDOW`].
     pub fn decide(
@@ -497,6 +498,31 @@ impl RemoteMuteGuard {
     /// erase who sent it.
     pub fn note_local(&mut self, muted: bool) {
         if !muted {
+            self.muted_by = None;
+        }
+    }
+
+    /// Revokes any pending undo token held by `from` (for instance, when an
+    /// unauthenticated session disconnects and its session number may be
+    /// handed to someone else). Leaves the mute cooldown untouched.
+    pub fn revoke(&mut self, from: &str) {
+        let Some((by, _)) = &self.muted_by else {
+            return;
+        };
+        if !from.is_empty() && by == from {
+            self.muted_by = None;
+        }
+    }
+
+    /// Revokes any pending undo token whose sender key begins with `prefix`
+    /// (for instance, all ephemeral session tokens on a reconnecting server,
+    /// or all tokens for a server that disconnected). Leaves the mute cooldown
+    /// untouched.
+    pub fn revoke_prefix(&mut self, prefix: &str) {
+        let Some((by, _)) = &self.muted_by else {
+            return;
+        };
+        if !prefix.is_empty() && by.starts_with(prefix) {
             self.muted_by = None;
         }
     }
@@ -561,6 +587,8 @@ pub struct Peers {
     /// Worth exactly as much as the peer is honest — which is enough for a mark
     /// in a roster and would not be enough for anything that mattered.
     muted_us: BTreeSet<u32>,
+    /// Server-reported client certificate hashes by session.
+    cert_hashes: HashMap<u32, String>,
 }
 
 impl Peers {
@@ -582,6 +610,27 @@ impl Peers {
         );
     }
 
+    /// Records the server-reported certificate hash for `session`, or clears
+    /// it when empty.
+    pub fn note_cert_hash(&mut self, session: u32, hash: &str) {
+        let trimmed = hash.trim();
+        if trimmed.is_empty() {
+            self.cert_hashes.remove(&session);
+        } else {
+            let lower = trimmed.to_ascii_lowercase();
+            self.cert_hashes.insert(session, lower);
+        }
+    }
+
+    /// Returns a stable sender key for `session`: `cert:{hash}` when the
+    /// server provided a certificate hash, or `session:{session}` otherwise.
+    pub fn peer_key(&self, session: u32) -> String {
+        match self.cert_hashes.get(&session) {
+            Some(h) if !h.is_empty() => format!("cert:{h}"),
+            _ => format!("session:{session}"),
+        }
+    }
+
     /// Forgets a session that has left. Its number may be handed to somebody
     /// else, who is not known to run anything.
     pub fn forget(&mut self, session: u32) {
@@ -589,6 +638,7 @@ impl Peers {
         self.owed.remove(&session);
         self.backups.remove(&session);
         self.muted_us.remove(&session);
+        self.cert_hashes.remove(&session);
     }
 
     /// Whether `session` said it understands being told about a local mute.
@@ -1288,6 +1338,87 @@ mod tests {
             g.decide(false, true, false, "", t0 + Duration::from_secs(1)),
             RemoteMuteDecision::UnmuteNotAllowed
         );
+    }
+
+    #[test]
+    fn revoking_a_departed_session_blocks_reuse_without_resetting_cooldown() {
+        let t0 = Instant::now();
+        let t5 = t0 + Duration::from_secs(5);
+        let t10 = t0 + Duration::from_secs(10);
+        let mut g = RemoteMuteGuard::default();
+        assert_eq!(
+            g.decide(true, false, false, "srv\0session:5", t0),
+            RemoteMuteDecision::Apply
+        );
+
+        // Non-matching or empty keys must not clear the grant.
+        g.revoke("");
+        g.revoke("srv\0session:50");
+        g.revoke("other\0session:5");
+        g.revoke("srv\0session:5");
+        assert_eq!(
+            g.decide(false, true, false, "srv\0session:5", t5),
+            RemoteMuteDecision::UnmuteNotAllowed
+        );
+
+        // Leaving must not reset the global mute cooldown either.
+        g.note_local(false);
+        assert_eq!(
+            g.decide(true, false, false, "srv\0session:6", t10),
+            RemoteMuteDecision::CoolingDown
+        );
+    }
+
+    #[test]
+    fn revoke_prefix_scopes_ephemeral_and_server_tokens() {
+        let t0 = Instant::now();
+        let t5 = t0 + Duration::from_secs(5);
+        let mut g = RemoteMuteGuard::default();
+        assert_eq!(
+            g.decide(true, false, false, "srv1\0cert:alice", t0),
+            RemoteMuteDecision::Apply
+        );
+
+        // Dropping ephemeral session tokens or another server leaves cert grants intact.
+        g.revoke_prefix("");
+        g.revoke_prefix("srv1\0session:");
+        g.revoke_prefix("srv10\0");
+        g.revoke_prefix("srv2\0");
+        assert_eq!(
+            g.decide(false, true, false, "srv1\0cert:alice", t5),
+            RemoteMuteDecision::Apply
+        );
+
+        // Disconnecting the server clears both cert and session grants for it.
+        let t1 = t0 + REMOTE_MUTE_COOLDOWN;
+        let t2 = t1 + Duration::from_secs(1);
+        assert_eq!(
+            g.decide(true, false, false, "srv1\0cert:alice", t1),
+            RemoteMuteDecision::Apply
+        );
+        g.revoke_prefix("srv1\0");
+        assert_eq!(
+            g.decide(false, true, false, "srv1\0cert:alice", t2),
+            RemoteMuteDecision::UnmuteNotAllowed
+        );
+    }
+
+    #[test]
+    fn peer_key_prefers_cert_hash_and_forgets_on_departure() {
+        let mut p = Peers::default();
+        assert_eq!(p.peer_key(7), "session:7");
+
+        p.note_cert_hash(7, "  AABBCC  ");
+        assert_eq!(p.peer_key(7), "cert:aabbcc");
+
+        // A departing session must drop its cert hash so a cert-less newcomer
+        // handed the same session number never inherits the old identity.
+        p.forget(7);
+        assert_eq!(p.peer_key(7), "session:7");
+
+        p.note_cert_hash(7, "deadbeef");
+        p.note_cert_hash(7, "   ");
+        assert_eq!(p.peer_key(7), "session:7");
     }
 
     #[test]

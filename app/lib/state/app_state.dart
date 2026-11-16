@@ -5000,6 +5000,24 @@ class AppState extends ChangeNotifier {
 
   void toggleMute() => _applyMute(!_muted);
 
+  /// Records every `setMicrophoneMuted` call attempted by [_applyMute] and
+  /// [_publishMute], before the FFI call (which throws when no engine is loaded
+  /// in unit tests).
+  @visibleForTesting
+  void Function(bool muted)? onMicrophoneMutedForTest;
+
+  @visibleForTesting
+  void setCapturingForTest({required bool capturing}) {
+    _capturing = capturing;
+  }
+
+  void _pushEngineMute(bool muted) {
+    onMicrophoneMutedForTest?.call(muted);
+    try {
+      setMicrophoneMuted(muted: muted);
+    } catch (_) {}
+  }
+
   /// The one way the microphone's mute changes, whoever asked.
   ///
   /// **Also told to every server, as Mumble's `self_mute`.** It never used to
@@ -5007,8 +5025,14 @@ class AppState extends ChangeNotifier {
   /// left the other riders unable to tell a muted rider from a silent one —
   /// and left a MumbleWay rider unable to offer "Unmute on server" to somebody
   /// who muted themselves and forgot, because nothing said they had.
-  void _applyMute(bool muted) {
+  void _applyMute(bool muted, {bool remote = false}) {
     _muted = muted;
+    if (!remote && !muted && effectivelyMuted) {
+      // Unmuting by hand must still invoke `note_local(false)` in the core
+      // when pocket mode has capture paused (`effectivelyMuted` stays true),
+      // before `_publishMute` pushes the effective capture mute.
+      _pushEngineMute(false);
+    }
     _publishMute();
   }
 
@@ -5019,9 +5043,7 @@ class AppState extends ChangeNotifier {
   /// listening state advertised as unmuted while unable to transmit.
   void _publishMute() {
     final muted = effectivelyMuted;
-    try {
-      setMicrophoneMuted(muted: muted);
-    } catch (_) {}
+    _pushEngineMute(muted);
     for (final entry in runtimes.entries) {
       if (entry.value.isLive) _mirrorSelfMute(entry.key, muted);
     }
@@ -5622,7 +5644,7 @@ class AppState extends ChangeNotifier {
         // this catches the interface up, and tells every server, so the
         // button reads true and the rider can undo it the way they would
         // undo their own.
-        _applyMute(muted);
+        _applyMute(muted, remote: true);
         _remoteMutes.add(
           RemoteMuteNotice(serverId: serverId, muted: muted, by: by),
         );

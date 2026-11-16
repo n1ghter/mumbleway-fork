@@ -43,12 +43,19 @@ bool qrOffersSaveAs([String? os]) => const {
   'macos',
 }.contains(os ?? Platform.operatingSystem);
 
+final _qrUnsafeChars = RegExp(r'[^\p{L}\p{N}_-]+', unicode: true);
+final _qrEdgePunctuation = RegExp(r'^[_-]+|[_-]+$');
+
 /// File name offered for the saved or shared picture of [serverName]'s code.
 ///
 /// Reduced to characters every file system accepts, because the name is the
 /// rider's own and Windows refuses half of what people type into one.
-String qrFileName(String serverName) =>
-    '${serverName.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_')}-qr.png';
+String qrFileName(String serverName) {
+  final stem = serverName
+      .replaceAll(_qrUnsafeChars, '_')
+      .replaceAll(_qrEdgePunctuation, '');
+  return '${stem.isEmpty ? 'mumbleway' : stem}-qr.png';
+}
 
 /// Side of the code as rendered for sharing or saving, in pixels.
 ///
@@ -352,25 +359,31 @@ class _Body extends StatelessWidget {
   Future<void> _shareImage(BuildContext context) async {
     final l = L.of(context);
     final messenger = ScaffoldMessenger.of(context);
+    Uint8List? bytes;
     try {
-      final png = await renderQrPng(link);
-      if (png == null) throw Exception(l.qrCouldNotRender);
+      bytes = await renderQrPng(link);
+      if (bytes == null) throw Exception(l.qrCouldNotRender);
 
       final dir = await getTemporaryDirectory();
       final file = File('${dir.path}/${qrFileName(server.name)}');
-      await file.writeAsBytes(png, flush: true);
-
-      await SharePlus.instance.share(
-        ShareParams(
-          files: [XFile(file.path, mimeType: 'image/png')],
-          subject: l.joinMeOn(server.name),
-        ),
-      );
+      try {
+        await file.writeAsBytes(bytes, flush: true);
+        await SharePlus.instance.share(
+          ShareParams(
+            files: [XFile(file.path, mimeType: 'image/png')],
+            subject: l.joinMeOn(server.name),
+          ),
+        );
+      } finally {
+        try {
+          await file.delete();
+        } catch (_) {}
+      }
     } on UnimplementedError {
       // A desktop with no share sheet for files — Linux, or a Windows older
       // than the one that brought the system share UI. Saving is the next best
       // thing, and is offered beside this button there anyway.
-      if (context.mounted) await _saveImage(context);
+      if (context.mounted) await _saveImage(context, bytes: bytes);
     } catch (e) {
       showError(messenger, '$e');
     }
@@ -378,7 +391,7 @@ class _Body extends StatelessWidget {
 
   /// Writes the picture wherever the rider chooses, through the system's own
   /// save dialog.
-  Future<void> _saveImage(BuildContext context) async {
+  Future<void> _saveImage(BuildContext context, {Uint8List? bytes}) async {
     final l = L.of(context);
     final messenger = ScaffoldMessenger.of(context);
     try {
@@ -395,7 +408,7 @@ class _Body extends StatelessWidget {
       var path = location.path;
       if (!path.toLowerCase().endsWith('.png')) path = '$path.png';
 
-      final png = await renderQrPng(link);
+      final png = bytes ?? await renderQrPng(link);
       if (png == null) throw Exception(l.qrCouldNotRender);
       await File(path).writeAsBytes(png, flush: true);
 

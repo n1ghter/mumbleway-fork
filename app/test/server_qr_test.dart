@@ -22,8 +22,23 @@ void main() {
 
   test('the file name is safe on every file system', () {
     expect(qrFileName('Obrezki'), 'Obrezki-qr.png');
-    expect(qrFileName('My: server/1?'), 'My__server_1_-qr.png');
-    expect(qrFileName('Сервер'), '______-qr.png');
+    expect(qrFileName('Сервер'), 'Сервер-qr.png');
+    expect(qrFileName('Мой сервер 1'), 'Мой_сервер_1-qr.png');
+    expect(qrFileName('My: server/1?'), 'My_server_1-qr.png');
+    expect(qrFileName(r'a<b>c:d"e/f\g|h?i*j'), 'a_b_c_d_e_f_g_h_i_j-qr.png');
+    expect(qrFileName('srv\x00\x1f\x7fname'), 'srv_name-qr.png');
+
+    for (final blank in const [
+      '',
+      '   ',
+      '...',
+      '___',
+      '---',
+      r'<>:"/\|?*',
+      '\x00\x1f\x7f',
+    ]) {
+      expect(qrFileName(blank), 'mumbleway-qr.png');
+    }
   });
 
   testWidgets('the picture is a square PNG on an opaque white field', (

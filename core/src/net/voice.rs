@@ -108,6 +108,7 @@ pub struct VoiceSocket {
     crypt: CryptState,
     last_pong: Option<Instant>,
     last_ping_sent: Option<Instant>,
+    bound_at: Instant,
     established: bool,
     /// When decryption last worked, and when a resync was last asked for.
     resync: crate::crypto::ResyncGuard,
@@ -116,7 +117,7 @@ pub struct VoiceSocket {
 impl VoiceSocket {
     /// Binds a local socket and connects it to `peer` so it only sees that server.
     pub async fn bind(peer: SocketAddr, crypt: CryptState) -> Result<Self> {
-        Self::try_bind(peer, crypt).await.map_err(|(e, _)| e)
+        Self::try_bind(peer, crypt).await.map_err(|b| b.0)
     }
 
     /// Like [`Self::bind`], but hands the cipher back when the socket cannot
@@ -129,7 +130,7 @@ impl VoiceSocket {
     pub async fn try_bind(
         peer: SocketAddr,
         crypt: CryptState,
-    ) -> std::result::Result<Self, (crate::error::CoreError, CryptState)> {
+    ) -> std::result::Result<Self, Box<(crate::error::CoreError, CryptState)>> {
         // Match the address family of the server we resolved.
         let bind_addr: SocketAddr = if peer.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
@@ -138,19 +139,21 @@ impl VoiceSocket {
         };
         let socket = match UdpSocket::bind(bind_addr).await {
             Ok(s) => s,
-            Err(e) => return Err((e.into(), crypt)),
+            Err(e) => return Err(Box::new((e.into(), crypt))),
         };
         if let Err(e) = socket.connect(peer).await {
-            return Err((e.into(), crypt));
+            return Err(Box::new((e.into(), crypt)));
         }
 
+        let now = Instant::now();
         Ok(Self {
             socket,
             crypt,
             last_pong: None,
             last_ping_sent: None,
+            bound_at: now,
             established: false,
-            resync: crate::crypto::ResyncGuard::new(Instant::now()),
+            resync: crate::crypto::ResyncGuard::new(now),
         })
     }
 
@@ -165,6 +168,19 @@ impl VoiceSocket {
             Some(t) => now.duration_since(t) < UDP_STALE_AFTER,
             None => false,
         }
+    }
+
+    /// Whether this socket has never heard a pong and has outlived the
+    /// initial verification window.
+    pub fn is_stale_unverified(&self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.bound_at);
+        self.last_pong.is_none() && elapsed >= UDP_STALE_AFTER
+    }
+
+    /// Replaces the cipher state after a mid-session `CryptSetup` rekey.
+    pub fn set_crypt(&mut self, crypt: CryptState) {
+        self.crypt = crypt;
+        self.resync.note_good(Instant::now());
     }
 
     pub fn crypt_stats(&self) -> crate::crypto::CryptStats {
@@ -320,7 +336,7 @@ mod tests {
         let crypt = first.into_crypt();
         let second = match VoiceSocket::try_bind(peer.local_addr().unwrap(), crypt).await {
             Ok(s) => s,
-            Err((e, _)) => panic!("rebinding failed: {e}"),
+            Err(err) => panic!("rebinding failed: {}", err.0),
         };
         assert_eq!(second.encrypt_iv(), &iv);
     }
@@ -426,5 +442,79 @@ mod tests {
         let client = VoiceSocket::bind(dead, crypt).await.unwrap();
         assert!(!client.is_healthy(Instant::now()));
         assert!(!client.is_established());
+    }
+
+    #[tokio::test]
+    async fn unverified_socket_turns_stale_after_window() {
+        let (crypt, _) = crypt_pair();
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let client = VoiceSocket::bind(dead, crypt).await.unwrap();
+        let bound_at = client.bound_at;
+        let just_before = bound_at + UDP_STALE_AFTER - Duration::from_millis(1);
+
+        assert!(!client.is_stale_unverified(bound_at));
+        assert!(!client.is_stale_unverified(just_before));
+        assert!(client.is_stale_unverified(bound_at + UDP_STALE_AFTER));
+    }
+
+    #[tokio::test]
+    async fn verified_socket_is_not_stale_unverified() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (client_crypt, mut server_crypt) = crypt_pair();
+        let mut client = VoiceSocket::bind(server_addr, client_crypt).await.unwrap();
+
+        client.send_ping(1).await.unwrap();
+        let mut buf = [0u8; 2048];
+        let (n, from) = server.recv_from(&mut buf).await.unwrap();
+        let plain = server_crypt.decrypt(&buf[..n]).unwrap();
+        let echo = server_crypt.encrypt(&plain).unwrap();
+        server.send_to(&echo, from).await.unwrap();
+
+        let ev = client.recv().await.unwrap();
+        assert!(matches!(ev, UdpEvent::Pong { .. }));
+        let much_later = Instant::now() + UDP_STALE_AFTER * 2;
+        assert!(!client.is_stale_unverified(much_later));
+    }
+
+    #[tokio::test]
+    async fn set_crypt_replaces_cipher_and_resets_resync() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (old_client, mut old_server) = crypt_pair();
+        let mut client = VoiceSocket::bind(server_addr, old_client).await.unwrap();
+
+        let before_sleep = Instant::now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before_rekey = Instant::now();
+        assert!(before_rekey > before_sleep);
+
+        let key = [0x99u8; 16];
+        let client_iv = [0x10u8; 16];
+        let server_iv = [0x20u8; 16];
+        let new_client = CryptState::new(&key, &client_iv, &server_iv).unwrap();
+        let mut new_server = CryptState::new(&key, &server_iv, &client_iv).unwrap();
+
+        client.set_crypt(new_client);
+        assert_eq!(client.encrypt_iv(), &client_iv);
+        let probe = before_sleep + crate::crypto::resync::RESYNC_AFTER;
+        assert!(!client.resync.should_request(probe));
+
+        client.send_ping(42).await.unwrap();
+        let mut buf = [0u8; 2048];
+        let (n, from) = server.recv_from(&mut buf).await.unwrap();
+        assert!(old_server.decrypt(&buf[..n]).is_err());
+        let plain = new_server.decrypt(&buf[..n]).unwrap();
+        assert_eq!(audio_packet::decode_ping(&plain).unwrap(), 42);
+
+        let stale = old_server.encrypt(&audio_packet::encode_ping(7)).unwrap();
+        server.send_to(&stale, from).await.unwrap();
+        let ev = client.recv().await.unwrap();
+        assert!(matches!(ev, UdpEvent::Rejected(_)));
+
+        let fresh = new_server.encrypt(&plain).unwrap();
+        server.send_to(&fresh, from).await.unwrap();
+        let ev = client.recv().await.unwrap();
+        assert!(matches!(ev, UdpEvent::Pong { .. }));
     }
 }

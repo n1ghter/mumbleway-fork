@@ -2,12 +2,12 @@
 <!--
   What Android's backup service carries, on Android 11 and earlier.
 
-  Preferences only, which is where the server list and every setting live. An
-  <include> makes this a list rather than a filter: nothing outside it is
-  backed up, so the client identity under files/ stays on this device by
-  omission. See data_extraction_rules.xml for the modern equivalent, and for
-  why the identity is treated differently from the list.
+  FlutterSharedPreferences.xml is excluded so plaintext preferences never leave
+  the device in cloud backup. Nothing outside <include> is backed up, so the
+  client identity under files/ and noBackupFilesDir/secrets.enc stay on this
+  device. See data_extraction_rules.xml for Android 12+.
 -->
 <full-backup-content>
     <include domain="sharedpref" path="."/>
+    <exclude domain="sharedpref" path="FlutterSharedPreferences.xml"/>
 </full-backup-content>

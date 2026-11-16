@@ -4325,7 +4325,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn spoofed_display_name_cannot_undo_remote_mute() {
         let t0 = std::time::Instant::now();
         let t1 = t0 + std::time::Duration::from_secs(10);

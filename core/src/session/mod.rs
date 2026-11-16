@@ -842,7 +842,8 @@ impl SessionInner {
                 }
                 // UDP unavailable for now; the tunnel still works, and the
                 // cipher is kept so UDP can be tried again later.
-                Err((e, crypt)) => {
+                Err(err) => {
+                    let (e, crypt) = *err;
                     tracing::warn!("could not open the UDP socket ({e}), tunnelling voice");
                     state.crypt = Some(crypt);
                     state.udp_retry.failed(Instant::now());
@@ -1134,7 +1135,8 @@ impl SessionInner {
                                     tracing::info!("opened a new UDP socket, probing it");
                                     *udp = Some(s);
                                 }
-                                Err((e, crypt)) => {
+                                Err(err) => {
+                                    let (e, crypt) = *err;
                                     state.crypt = Some(crypt);
                                     state.udp_retry.failed(now);
                                     tracing::warn!("still cannot open a UDP socket: {e}");

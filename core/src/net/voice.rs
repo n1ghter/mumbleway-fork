@@ -122,7 +122,7 @@ pub struct VoiceSocket {
 impl VoiceSocket {
     /// Binds a local socket and connects it to `peer` so it only sees that server.
     pub async fn bind(peer: SocketAddr, crypt: CryptState) -> Result<Self> {
-        Self::try_bind(peer, crypt).await.map_err(|(e, _)| e)
+        Self::try_bind(peer, crypt).await.map_err(|b| b.0)
     }
 
     /// Like [`Self::bind`], but hands the cipher back when the socket cannot
@@ -135,7 +135,7 @@ impl VoiceSocket {
     pub async fn try_bind(
         peer: SocketAddr,
         crypt: CryptState,
-    ) -> std::result::Result<Self, (crate::error::CoreError, CryptState)> {
+    ) -> std::result::Result<Self, Box<(crate::error::CoreError, CryptState)>> {
         // Match the address family of the server we resolved.
         let bind_addr: SocketAddr = if peer.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
@@ -144,10 +144,10 @@ impl VoiceSocket {
         };
         let socket = match UdpSocket::bind(bind_addr).await {
             Ok(s) => s,
-            Err(e) => return Err((e.into(), crypt)),
+            Err(e) => return Err(Box::new((e.into(), crypt))),
         };
         if let Err(e) = socket.connect(peer).await {
-            return Err((e.into(), crypt));
+            return Err(Box::new((e.into(), crypt)));
         }
 
         let now = Instant::now();
@@ -361,7 +361,7 @@ mod tests {
         let crypt = first.into_crypt();
         let second = match VoiceSocket::try_bind(peer.local_addr().unwrap(), crypt).await {
             Ok(s) => s,
-            Err((e, _)) => panic!("rebinding failed: {e}"),
+            Err(err) => panic!("rebinding failed: {}", err.0),
         };
         assert_eq!(second.encrypt_iv(), iv);
     }

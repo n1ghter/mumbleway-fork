@@ -2,7 +2,8 @@
 name = "rust_lib_mumbleway"
 version = "0.1.0"
 edition = "2021"
-# The same licence as `core`, which this crate links whole.
+# The same licence as `core`, which this crate links whole (matches the
+# GPL-3.0 LICENSE at the repository root).
 license = "GPL-3.0-or-later"
 
 [lib]

@@ -8,12 +8,26 @@ description: Собственная лицензия MumbleWay и каждый �
 
 ## MumbleWay
 
-**GNU General Public License, версия 3.** Полный текст —
-[в репозитории]({{ site.repo }}/blob/main/LICENSE).
+**GNU General Public License, версия 3 (`GPL-3.0-or-later`).** Полный текст
+— [в репозитории]({{ site.repo }}/blob/main/LICENSE).
 
-Программу можно использовать, изучать, изменять и распространять. Если вы
-распространяете изменённую версию, она должна выходить под той же лицензией, а
-её исходный код — быть доступным.
+Программу можно использовать, изучать, изменять и распространять по условиям
+GPLv3. Любое распространение сборок — как изменённых, так и неизменённых —
+должно сохранять ту же лицензию и обеспечивать доступность соответствующего
+исходного кода (для официальных сборок он открыт в
+[публичном репозитории]({{ site.repo }})).
+
+<div class="panel">
+<p><strong>Распространение через магазины приложений.</strong> Официальные
+сборки в Apple App Store, Mac App Store, Google Play и Microsoft Store
+публикуются правообладателем MumbleWay вместе с полным исходным кодом в
+репозитории выше. Все сторонние компоненты, входящие в приложение, используют
+разрешительные лицензии, совместимые с GPLv3 (BSD-3-Clause, BSD-2-Clause, MIT,
+Apache-2.0, ISC). Поскольку условия Apple App Store и Mac App Store накладывают
+DRM и ограничивают дальнейшее распространение загруженных пакетов, сторонним
+распространителям следует распространять приложение на условиях GPLv3 вне
+магазинов с DRM (например, из исходников или через GitHub Releases).</p>
+</div>
 
 <div class="panel">
 <p><strong>С проектом Mumble не связан.</strong> MumbleWay — независимый
@@ -44,12 +58,14 @@ description: Собственная лицензия MumbleWay и каждый �
 | [`ndarray`](https://crates.io/crates/ndarray) | Тип массива, который принимает и возвращает сам интерфейс очистителя речи | MIT / Apache-2.0 |
 | [`cpal`](https://crates.io/crates/cpal) | Кроссплатформенный доступ к аудиоустройствам. Взят в `third_party` и изменён одним фрагментом, чтобы поток записи на Android мог запросить телефонный входной пресет, который cpal иначе не запрашивает никогда — см. `third_party/cpal/PATCH.md` | Apache-2.0 |
 | [`dasp_sample`](https://crates.io/crates/dasp_sample) | Преобразование форматов отсчётов | MIT / Apache-2.0 |
+| [`sonora`](https://github.com/dignifiedquire/sonora) | Порт WebRTC AudioProcessing (M145) на чистом Rust; обеспечивает эхоподавитель AEC3 в `core/src/audio/aec3.rs` | BSD 3-Clause (с патентным грантом WebRTC) |
 
 </div>
 
-Всё остальное в тракте — эхоподавитель, гейт, экспандер, блок спектрального
-вычитания, лимитер, АРУ, защита от обратной связи, детектор основного тона и
-буфер джиттера — написано для этого проекта и выходит под его же GPL v3.
+Всё остальное в тракте — резервный эхоподавитель во временной области
+(`audio::aec`), гейт, экспандер, блок спектрального вычитания, лимитер, АРУ,
+защита от обратной связи, детектор основного тона и буфер джиттера — написано
+для этого проекта и выходит под его же GPL v3.
 
 ## Rust
 
@@ -61,7 +77,7 @@ description: Собственная лицензия MumbleWay и каждый �
 | [`rustls`](https://github.com/rustls/rustls), `rustls-pemfile`, `webpki-roots` | TLS без OpenSSL | Apache-2.0 / MIT / ISC |
 | [`rcgen`](https://crates.io/crates/rcgen) | Генерация клиентского сертификата | MIT / Apache-2.0 |
 | [`prost`](https://crates.io/crates/prost) | Protocol Buffers для управляющего канала Mumble | Apache-2.0 |
-| [`aes`](https://crates.io/crates/aes), `aes-gcm`, `cipher` | OCB/AES для шифрования голоса по UDP | MIT / Apache-2.0 |
+| [`aes`](https://crates.io/crates/aes), [`cipher`](https://crates.io/crates/cipher) | Блочные примитивы AES-128, используемые `core/src/crypto/ocb2.rs` для шифрования голоса по UDP (OCB2 перенесён из эталонного `CryptStateOCB2.cpp` проекта Mumble, BSD 3-Clause) | MIT / Apache-2.0 (эталон OCB2: BSD 3-Clause) |
 | [`sha2`](https://crates.io/crates/sha2), `hex` | Отпечатки сертификатов | MIT / Apache-2.0 |
 | [`serde`](https://serde.rs/), `serde_json` | Сериализация настроек и списка серверов | MIT / Apache-2.0 |
 | [`tracing`](https://crates.io/crates/tracing) | Структурированное журналирование | MIT |
@@ -83,7 +99,7 @@ description: Собственная лицензия MumbleWay и каждый �
 |---|---|---|
 | [Flutter](https://flutter.dev/) и Dart SDK | Каркас приложения | BSD 3-Clause |
 | [`flutter_rust_bridge`](https://cjycode.com/flutter_rust_bridge/) | Мост между интерфейсом на Dart и движком на Rust | MIT |
-| [`shared_preferences`](https://pub.dev/packages/shared_preferences), [`path_provider`](https://pub.dev/packages/path_provider), [`share_plus`](https://pub.dev/packages/share_plus), [`package_info_plus`](https://pub.dev/packages/package_info_plus), [`file_selector`](https://pub.dev/packages/file_selector), [`url_launcher`](https://pub.dev/packages/url_launcher) | Платформенная обвязка | BSD 3-Clause |
+| [`shared_preferences`](https://pub.dev/packages/shared_preferences), [`path_provider`](https://pub.dev/packages/path_provider), [`share_plus`](https://pub.dev/packages/share_plus), [`package_info_plus`](https://pub.dev/packages/package_info_plus), [`connectivity_plus`](https://pub.dev/packages/connectivity_plus), [`file_selector`](https://pub.dev/packages/file_selector), [`url_launcher`](https://pub.dev/packages/url_launcher) | Платформенная обвязка | BSD 3-Clause |
 | [`http`](https://pub.dev/packages/http), [`intl`](https://pub.dev/packages/intl) | Сеть и локализация | BSD 3-Clause |
 | [`qr_flutter`](https://pub.dev/packages/qr_flutter), [`qr`](https://pub.dev/packages/qr) | Рисуют приглашения на сервер | BSD 3-Clause |
 | [`mobile_scanner`](https://pub.dev/packages/mobile_scanner) | Считывает их обратно | BSD 3-Clause |

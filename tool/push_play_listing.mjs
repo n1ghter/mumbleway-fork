@@ -146,13 +146,28 @@ await withEdit(key, PKG, async (edit) => {
   console.log(`${PKG} — this repository is at ${version}\n`);
 
   // What production actually offers, which decides whether this text is honest.
+  // Only `completed` releases are live; a `draft` release carries version codes
+  // too, and must not bypass the version guard while nobody can install it.
   const tracks = await edit.get('/tracks');
   const production = (tracks.tracks ?? []).find((t) => t.track === 'production');
-  const liveNames = (production?.releases ?? [])
-    .flatMap((r) => r.versionCodes?.length ? [r.name ?? '(unnamed)'] : [])
+  const releases = production?.releases ?? [];
+  const liveNames = releases
+    .flatMap((r) =>
+      r.status === 'completed' && r.versionCodes?.length ? [r.name ?? '(unnamed)'] : []
+    )
     .filter(Boolean);
   const live = liveNames[0] ?? null;
-  console.log(`production track: ${live ?? 'nothing released'}`);
+  const nonLive = releases
+    .flatMap((r) =>
+      r.status !== 'completed' && r.versionCodes?.length
+        ? [`${r.name ?? '(unnamed)'} [${r.status ?? 'unknown'}]`]
+        : []
+    )
+    .filter(Boolean);
+  console.log(
+    `production track: ${live ?? 'nothing released'}` +
+      (nonLive.length ? ` (non-live: ${nonLive.join(', ')})` : '')
+  );
 
   const behind = live ? !live.startsWith(version) : true;
   if (behind) {

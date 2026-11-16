@@ -42,6 +42,9 @@ const SERVER_SILENCE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Cap on how long the Version/Authenticate/ServerSync exchange may take.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Shortest interval between answering empty `CryptSetup` nonce requests.
+const NONCE_REPLY_COOLDOWN: Duration = Duration::from_secs(1);
+
 /// Channels connecting a session to the audio engine.
 pub struct AudioBridge {
     /// Encoded Opus frames ready to transmit.
@@ -109,10 +112,15 @@ struct LiveState {
     /// A decrypt nonce from the server, waiting to be applied to whichever half
     /// of this session is holding the cipher. See the `CryptSetup` arm.
     pending_decrypt_iv: Option<Vec<u8>>,
+    /// A full cipher rekey from `CryptSetup`, waiting to replace the cipher
+    /// held by the live UDP socket once `handle_control` returns.
+    pending_crypt: Option<CryptState>,
     /// The server asked for our encrypt nonce, because *its* decryption of
     /// our packets lost step. Answered by whichever half holds the cipher,
     /// like `pending_decrypt_iv`.
     nonce_requested: bool,
+    /// When we last answered an empty `CryptSetup` nonce request.
+    last_nonce_reply: Option<Instant>,
     /// When to open a new UDP socket after the last one failed.
     udp_retry: UdpRetry,
     /// Which comments and pictures we hold, and which still have to be asked
@@ -193,7 +201,9 @@ impl LiveState {
             perms: HashMap::new(),
             rights_sent: None,
             pending_decrypt_iv: None,
+            pending_crypt: None,
             nonce_requested: false,
+            last_nonce_reply: None,
             udp_retry: UdpRetry::default(),
             blobs: notes::Blobs::default(),
             listening: Vec::new(),
@@ -668,6 +678,11 @@ impl Session {
             }
         }
 
+        // Apply any resync nonce or nonce request received during the handshake
+        // before `state.crypt` moves into `VoiceSocket`.
+        let mut no_udp = None;
+        flush_pending_crypt(&mut state, &mut no_udp, &mut writer).await?;
+
         // The announcement is not sent here. It goes out on the first health
         // tick, from the same code that repeats it — see `run_connected`. That
         // tick fires immediately, so it costs nothing, and it leaves one path
@@ -808,37 +823,16 @@ impl Session {
                         }
                     };
                     state.last_heard = Instant::now();
-                    if let Some(reason) = self.handle_control(msg_type, &payload, state, writer).await? {
+                    if let Some(reason) = self
+                        .handle_control(msg_type, &payload, state, writer)
+                        .await?
+                    {
                         return Ok(reason);
                     }
                     // Applied here because this is where the cipher is: the UDP
                     // socket owns it while one exists, and `state.crypt` only
                     // before the socket is built.
-                    if let Some(iv) = state.pending_decrypt_iv.take() {
-                        let applied = match udp.as_mut() {
-                            Some(s) => s.set_decrypt_iv(&iv),
-                            None => match state.crypt.as_mut() {
-                                Some(c) => c.set_decrypt_iv(&iv),
-                                None => Ok(()),
-                            },
-                        };
-                        if let Err(e) = applied {
-                            tracing::warn!("server sent a resync nonce we could not use: {e}");
-                        }
-                    }
-                    // The other direction: the server cannot decrypt us and
-                    // has asked for our nonce. Unanswered, our voice stays
-                    // undecryptable to everybody for as long as UDP is up.
-                    if std::mem::take(&mut state.nonce_requested) {
-                        let iv = match udp.as_ref() {
-                            Some(s) => Some(s.encrypt_iv().to_vec()),
-                            None => state.crypt.as_ref().map(|c| c.encrypt_iv().to_vec()),
-                        };
-                        if let Some(iv) = iv {
-                            tracing::info!("server asked for our voice nonce, sending it");
-                            writer.send(MessageType::CryptSetup, &nonce_reply(iv)).await?;
-                        }
-                    }
+                    flush_pending_crypt(state, udp, writer).await?;
                 }
 
                 // --- UDP voice ---------------------------------------------
@@ -1020,17 +1014,33 @@ impl Session {
                             }
                         }
                     }
-                    // Fall back to the tunnel if UDP goes quiet mid-session.
-                    if state.transport == Transport::Udp
-                        && !udp.as_ref().map(|s| s.is_healthy(now)).unwrap_or(false)
-                    {
-                        state.transport = Transport::TcpTunnel;
-                        // Worth a line of its own: voice keeps working, so
-                        // nothing else announces it, yet it changes latency and
-                        // is the usual reason a link "sounds worse" for no
-                        // visible cause.
-                        tracing::warn!("UDP went quiet, tunnelling voice over TCP");
-                        self.emit(SessionEvent::TransportChanged(Transport::TcpTunnel)).await;
+                    // Fall back to the tunnel if UDP goes quiet mid-session, or
+                    // drop an unverified socket that never got a pong so
+                    // `UdpRetry` can rebind a fresh one.
+                    let udp_dead = udp.as_ref().is_some_and(|s| {
+                        (state.transport == Transport::Udp && !s.is_healthy(now))
+                            || (state.transport == Transport::TcpTunnel
+                                && s.is_stale_unverified(now))
+                    });
+                    if udp_dead {
+                        if state.transport != Transport::TcpTunnel {
+                            state.transport = Transport::TcpTunnel;
+                            // Worth a line of its own: voice keeps working, so
+                            // nothing else announces it, yet it changes latency
+                            // and is the usual reason a link "sounds worse" for
+                            // no visible cause.
+                            tracing::warn!("UDP went quiet, tunnelling voice over TCP");
+                            self.emit(SessionEvent::TransportChanged(Transport::TcpTunnel))
+                                .await;
+                        } else {
+                            tracing::warn!(
+                                "UDP probe timed out without a pong, dropping dead socket"
+                            );
+                        }
+                        if let Some(dead) = udp.take() {
+                            state.crypt = Some(dead.into_crypt());
+                        }
+                        state.udp_retry.failed(now);
                     }
                     state.stats.transport = Some(state.transport.into());
                     self.emit(SessionEvent::Stats(state.stats)).await;
@@ -1242,30 +1252,7 @@ impl Session {
             }
             MessageType::CryptSetup => {
                 let m = mumble::CryptSetup::decode(payload)?;
-                match (m.key, m.client_nonce, m.server_nonce) {
-                    (Some(k), Some(cn), Some(sn)) => {
-                        // client_nonce is our encrypt IV, server_nonce our decrypt IV.
-                        state.crypt = Some(CryptState::new(&k, &cn, &sn)?);
-                    }
-                    // An empty CryptSetup from the server is the same question
-                    // we ask it: "tell me your nonce". The official client
-                    // answers it with its encrypt IV; this one used to fall
-                    // through to the arm below and say nothing.
-                    (None, None, None) => state.nonce_requested = true,
-                    (None, None, Some(sn)) => {
-                        // A resync of the decrypt IV alone: either the answer
-                        // to our own request, or the server volunteering one.
-                        //
-                        // **Kept for the caller to apply**, because once the
-                        // session is connected the cipher lives inside the UDP
-                        // socket rather than here — applying it to
-                        // `state.crypt` would land on a `None` and the resync
-                        // would silently do nothing, which is exactly how this
-                        // path used to fail.
-                        state.pending_decrypt_iv = Some(sn.to_vec());
-                    }
-                    _ => {}
-                }
+                apply_crypt_setup(state, m, Instant::now())?;
             }
             MessageType::ServerConfig => {
                 let m = mumble::ServerConfig::decode(payload)?;
@@ -2474,6 +2461,80 @@ fn discard_queued<T>(rx: &mut mpsc::Receiver<T>) -> usize {
     n
 }
 
+/// Applies a decoded `CryptSetup` control message to `state`.
+fn apply_crypt_setup(state: &mut LiveState, m: mumble::CryptSetup, now: Instant) -> Result<()> {
+    match (m.key, m.client_nonce, m.server_nonce) {
+        (Some(k), Some(cn), Some(sn)) => {
+            // client_nonce is our encrypt IV, server_nonce our decrypt IV.
+            let crypt = CryptState::new(&k, &cn, &sn)?;
+            state.crypt = Some(crypt.clone());
+            state.pending_crypt = Some(crypt);
+            state.pending_decrypt_iv = None;
+        }
+        // An empty CryptSetup from the server is the same question we ask it:
+        // "tell me your nonce". Throttle replies so rapid empty bursts cannot
+        // flood the control channel.
+        (None, None, None) => {
+            let cooled = |t| now.saturating_duration_since(t) >= NONCE_REPLY_COOLDOWN;
+            if state.last_nonce_reply.is_none_or(cooled) {
+                state.nonce_requested = true;
+            }
+        }
+        (None, None, Some(sn)) => {
+            // A resync of the decrypt IV alone: either the answer to our own
+            // request, or the server volunteering one.
+            //
+            // **Kept for the caller to apply**, because once the session is
+            // connected the cipher lives inside the UDP socket rather than here
+            // — applying it to `state.crypt` would land on a `None` and the
+            // resync would silently do nothing, which is exactly how this path
+            // used to fail.
+            state.pending_decrypt_iv = Some(sn.to_vec());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Applies queued cipher updates to the active cipher holder (`udp` if open,
+/// otherwise `state.crypt`) and sends a `nonce_reply` if requested.
+async fn flush_pending_crypt(
+    state: &mut LiveState,
+    udp: &mut Option<VoiceSocket>,
+    writer: &mut ControlWriter,
+) -> Result<()> {
+    if let Some(crypt) = state.pending_crypt.take() {
+        if let Some(s) = udp.as_mut() {
+            s.set_crypt(crypt);
+            state.crypt = None;
+        }
+    }
+    if let Some(iv) = state.pending_decrypt_iv.take() {
+        let applied = match udp.as_mut() {
+            Some(s) => s.set_decrypt_iv(&iv),
+            None => match state.crypt.as_mut() {
+                Some(c) => c.set_decrypt_iv(&iv),
+                None => Ok(()),
+            },
+        };
+        if let Err(e) = applied {
+            tracing::warn!("server sent a resync nonce we could not use: {e}");
+        }
+    }
+    if std::mem::take(&mut state.nonce_requested) {
+        let iv = match udp.as_ref() {
+            Some(s) => Some(s.encrypt_iv().to_vec()),
+            None => state.crypt.as_ref().map(|c| c.encrypt_iv().to_vec()),
+        };
+        if let Some(iv) = iv {
+            tracing::info!("server asked for our voice nonce, sending it");
+            writer.send(MessageType::CryptSetup, &nonce_reply(iv)).await?;
+            state.last_nonce_reply = Some(Instant::now());
+        }
+    }
+    Ok(())
+}
+
 /// Our answer to a server's empty `CryptSetup`: our encrypt nonce, which is
 /// what the server decrypts our packets with, and nothing else.
 fn nonce_reply(encrypt_iv: Vec<u8>) -> mumble::CryptSetup {
@@ -2584,5 +2645,65 @@ mod tests {
         assert_eq!(second.1, vec![3u8; 20]);
         assert!(second.2);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn full_crypt_setup_updates_both_crypt_and_pending_crypt() {
+        let mut state = LiveState::new();
+        let key = [0x11u8; 16];
+        let cn = [0x22u8; 16];
+        let sn = [0x33u8; 16];
+        let msg = mumble::CryptSetup {
+            key: Some(key.to_vec().into()),
+            client_nonce: Some(cn.to_vec().into()),
+            server_nonce: Some(sn.to_vec().into()),
+        };
+
+        apply_crypt_setup(&mut state, msg, Instant::now()).unwrap();
+        let crypt = state.crypt.as_ref().expect("state.crypt populated");
+        let pending = state.pending_crypt.as_ref().expect("pending_crypt queued");
+        assert_eq!(crypt.encrypt_iv(), &cn);
+        assert_eq!(crypt.decrypt_iv(), &sn);
+        assert_eq!(pending.encrypt_iv(), &cn);
+        assert_eq!(pending.decrypt_iv(), &sn);
+    }
+
+    #[test]
+    fn empty_crypt_setup_requests_are_throttled_to_one_per_second() {
+        let mut state = LiveState::new();
+        let t0 = Instant::now();
+
+        apply_crypt_setup(&mut state, mumble::CryptSetup::default(), t0).unwrap();
+        assert!(state.nonce_requested);
+
+        state.nonce_requested = false;
+        state.last_nonce_reply = Some(t0);
+
+        let too_soon = t0 + Duration::from_millis(500);
+        apply_crypt_setup(&mut state, mumble::CryptSetup::default(), too_soon).unwrap();
+        assert!(!state.nonce_requested);
+
+        let just_before = t0 + NONCE_REPLY_COOLDOWN - Duration::from_millis(1);
+        apply_crypt_setup(&mut state, mumble::CryptSetup::default(), just_before).unwrap();
+        assert!(!state.nonce_requested);
+
+        let after_cooldown = t0 + NONCE_REPLY_COOLDOWN;
+        apply_crypt_setup(&mut state, mumble::CryptSetup::default(), after_cooldown).unwrap();
+        assert!(state.nonce_requested);
+    }
+
+    #[test]
+    fn server_nonce_only_crypt_setup_queues_pending_decrypt_iv() {
+        let mut state = LiveState::new();
+        let sn = vec![0x44u8; 16];
+        let msg = mumble::CryptSetup {
+            key: None,
+            client_nonce: None,
+            server_nonce: Some(sn.clone().into()),
+        };
+
+        apply_crypt_setup(&mut state, msg, Instant::now()).unwrap();
+        assert_eq!(state.pending_decrypt_iv, Some(sn));
+        assert!(!state.nonce_requested);
     }
 }

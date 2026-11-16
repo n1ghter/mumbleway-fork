@@ -257,8 +257,11 @@ impl SpeakerBuffer {
     ///
     /// Worth being able to remove: an automatic gain that adapts on the gaps
     /// between sentences raises the far end's room tone towards the target and
-    /// is heard as a hiss that comes up after every sentence. Being able to
-    /// take it out of the chain settles whether it is the cause in seconds.
+    /// is heard as a hiss that comes up after every sentence. The normaliser
+    /// no longer adapts on a speaker's background (see [`LevelNormalizer`]),
+    /// but the gain it holds from their speech still applies to the gaps, so
+    /// being able to take it out of the chain still settles in seconds whether
+    /// it is the cause of a hiss.
     pub fn set_normalisation(&mut self, on: bool) {
         self.normalise = on;
     }
@@ -669,7 +672,8 @@ impl SpeakerBuffer {
             };
             let n = self.decoder.decode_lost(fec.as_deref(), out).ok()?;
             if self.normalise {
-                self.normalizer.process(&mut out[..n]);
+                // Invented audio: gain applied, nothing learned from it.
+                self.normalizer.process_concealed(&mut out[..n]);
             }
             return Some(self.compressor.process(out, n, self.speed));
         }

@@ -18,7 +18,7 @@ use mumbleway_core::audio::engine::{
     AudioConfig, AudioCue, AudioEngine, AudioShared, TransmitMode,
 };
 use mumbleway_core::audio::feedback::FeedbackMode;
-use mumbleway_core::audio::{BitrateMode, LinkReport, LinkTracker, NoiseProfile, Quality};
+use mumbleway_core::audio::{BitrateMode, MultiLinkTracker, NoiseProfile, Quality};
 use mumbleway_core::diag::{self, LogEntry, LogLevel};
 use mumbleway_core::net::tls::Identity;
 use mumbleway_core::session::manager::{SessionManager, TaggedEvent};
@@ -975,6 +975,7 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
         },
     )?;
     let shared = audio.shared();
+    shared.set_bitrate_mode(BitrateMode::Auto);
 
     // Aggregate every session's events onto the Dart stream.
     let (ev_tx, mut ev_rx) = mpsc::channel::<TaggedEvent>(512);
@@ -1014,7 +1015,7 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
     // them, so the worst link decides, for the same reason the cap is the
     // tightest — see `audio::adaptive`.
     let mut own_sessions: HashMap<String, u32> = HashMap::new();
-    let mut own_links: HashMap<String, LinkTracker> = HashMap::new();
+    let mut own_links = MultiLinkTracker::default();
 
     rt.spawn(async move {
         // Owned by this task, which is the only place either kind of mute cue
@@ -1070,17 +1071,13 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
                         .and_then(|u| u.quality)
                     {
                         let t = q.up_total;
-                        let loss = own_links
-                            .entry(server_id.clone())
-                            .or_default()
-                            .on_totals(t.good.saturating_add(t.late), t.lost);
-                        if let Some(loss) = loss {
-                            let tunnelled = own_links.values().any(|l| l.tunnelled);
-                            bandwidth_shared.report_link(LinkReport {
-                                loss_up: Some(loss),
-                                queue_ms: None,
-                                tunnelled,
-                            });
+                        if let Some(report) = own_links.on_totals(
+                            &server_id,
+                            now(),
+                            t.good.saturating_add(t.late),
+                            t.lost,
+                        ) {
+                            bandwidth_shared.report_link(report);
                         }
                     }
                     emit(AppEvent::Users {
@@ -1148,16 +1145,15 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
                     // Our latest round trip, for "Auto"'s queueing delay. Not
                     // the ping on our own roster row: that is the mean over the
                     // whole session, and barely moves for a bad minute.
-                    let tracker = own_links.entry(server_id.clone()).or_default();
-                    tracker.tunnelled = matches!(s.transport, Some(TransportStat::TcpTunnel));
-                    let queue = tracker.on_rtt(now(), s.udp_ping_ms);
-                    let tunnelled = own_links.values().any(|l| l.tunnelled);
-                    if queue.is_some() || tunnelled {
-                        bandwidth_shared.report_link(LinkReport {
-                            loss_up: None,
-                            queue_ms: queue,
-                            tunnelled,
-                        });
+                    let tunnelled = matches!(s.transport, Some(TransportStat::TcpTunnel));
+                    if let Some(report) = own_links.on_stats(
+                        &server_id,
+                        now(),
+                        s.udp_ping_ms,
+                        s.udp_pings,
+                        tunnelled,
+                    ) {
+                        bandwidth_shared.report_link(report);
                     }
                     emit(AppEvent::Stats(UiStats {
                         server_id,
@@ -1189,6 +1185,7 @@ pub fn start_engine(options: StartupOptions) -> anyhow::Result<()> {
                 SessionEvent::Welcome(text) => emit(AppEvent::Welcome { server_id, text }),
                 SessionEvent::SelfSession(session) => {
                     own_sessions.insert(server_id.clone(), session);
+                    own_links.remove(&server_id);
                     emit(AppEvent::SelfSession { server_id, session })
                 }
                 SessionEvent::SelfSuppressed(suppressed) => {

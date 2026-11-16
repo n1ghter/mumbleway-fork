@@ -794,6 +794,7 @@ impl Session {
                         }
                         Ok(Some(UdpEvent::Pong { rtt })) => {
                             state.stats.udp_ping_ms = rtt.as_secs_f32() * 1000.0;
+                            state.stats.udp_pings = state.stats.udp_pings.wrapping_add(1);
                             state.udp_ping.record(state.stats.udp_ping_ms);
                             if state.transport != Transport::Udp {
                                 state.transport = Transport::Udp;

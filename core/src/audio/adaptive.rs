@@ -76,7 +76,7 @@
 //! `session::peers`, and it should only lower the ceiling to the old default,
 //! never below.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// The rates "Auto" moves between, lowest first, in bits per second.
@@ -124,6 +124,9 @@ pub const QUEUE_STEP_DOWN_MS: f32 = 150.0;
 pub const QUEUE_CLEAN_MS: f32 = 50.0;
 /// How long the lowest round trip is remembered as the empty-queue baseline.
 pub const BASE_RTT_WINDOW: Duration = Duration::from_secs(120);
+/// How long a server's latest loss or queueing figure stays fresh for
+/// pairing signals and combining multiple servers.
+pub const LINK_FRESH: Duration = Duration::from_secs(15);
 
 /// How long a link must stay clean before "Auto" climbs one rung.
 pub const CLEAN_BEFORE_UP: Duration = Duration::from_secs(30);
@@ -161,6 +164,22 @@ pub struct LinkReport {
     pub tunnelled: bool,
 }
 
+impl LinkReport {
+    /// Combines two reports by taking the worse of each signal.
+    pub fn worst(self, other: Self) -> Self {
+        let max_opt = |a: Option<f32>, b: Option<f32>| match (a, b) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        };
+        Self {
+            loss_up: max_opt(self.loss_up, other.loss_up),
+            queue_ms: max_opt(self.queue_ms, other.queue_ms),
+            tunnelled: self.tunnelled || other.tunnelled,
+        }
+    }
+}
+
 /// Turns what one server says about our connection into [`LinkReport`]
 /// figures. One per server: the counts and the baseline are per connection.
 #[derive(Debug, Default, Clone)]
@@ -171,8 +190,12 @@ pub struct LinkTracker {
     pending: (u32, u32),
     /// Round trips of the last [`BASE_RTT_WINDOW`].
     rtts: VecDeque<(Instant, f32)>,
-    last_rtt: Option<f32>,
+    last_ping_count: Option<u32>,
+    /// Unconfirmed queueing delay of the previous ping, for the two-in-a-row
+    /// filter.
     last_queue: Option<f32>,
+    /// Latest confirmed queueing delay and when it was observed.
+    confirmed_queue: Option<(Instant, f32)>,
     /// Whether this server's voice is going over TCP.
     pub tunnelled: bool,
 }
@@ -199,16 +222,17 @@ impl LinkTracker {
         Some(loss)
     }
 
-    /// Takes our latest UDP round trip and returns the queueing delay above
-    /// the recent lowest, once two pings in a row agree on it.
+    /// Takes our latest UDP round trip and ping counter and returns the
+    /// queueing delay above the recent lowest once two pings in a row agree.
     ///
-    /// The session republishes the latest ping every second, so a value equal
-    /// to the last one is the same ping and is ignored; zero means none yet.
-    pub fn on_rtt(&mut self, now: Instant, rtt_ms: f32) -> Option<f32> {
-        if rtt_ms.is_nan() || rtt_ms <= 0.0 || Some(rtt_ms) == self.last_rtt {
+    /// The session republishes `NetworkStats` every second, so an unchanged
+    /// `udp_pings` counter means the same ping and is ignored; non-finite or
+    /// non-positive round trips mean no measurement yet.
+    pub fn on_rtt(&mut self, now: Instant, rtt_ms: f32, udp_pings: u32) -> Option<f32> {
+        if !rtt_ms.is_finite() || rtt_ms <= 0.0 || Some(udp_pings) == self.last_ping_count {
             return None;
         }
-        self.last_rtt = Some(rtt_ms);
+        self.last_ping_count = Some(udp_pings);
         self.rtts.push_back((now, rtt_ms));
         while self
             .rtts
@@ -226,7 +250,102 @@ impl LinkTracker {
         // The smaller of this and the last: one spike is not a queue.
         let confirmed = self.last_queue.map(|q| q.min(queue));
         self.last_queue = Some(queue);
+        if let Some(q) = confirmed {
+            self.confirmed_queue = Some((now, q));
+        }
         confirmed
+    }
+
+    /// The latest confirmed queueing delay while still within [`LINK_FRESH`].
+    pub fn confirmed_queue(&self, now: Instant) -> Option<f32> {
+        self.confirmed_queue
+            .filter(|(at, _)| now.saturating_duration_since(*at) <= LINK_FRESH)
+            .map(|(_, q)| q)
+    }
+
+    /// Clears pending queue state when voice falls back to the TCP tunnel.
+    fn clear_queue(&mut self) {
+        self.last_queue = None;
+        self.confirmed_queue = None;
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct ServerLink {
+    tracker: LinkTracker,
+    last_loss: Option<(Instant, f32)>,
+}
+
+/// Tracks our outgoing link across every connected server and combines active
+/// servers into a single worst-case [`LinkReport`].
+#[derive(Debug, Default, Clone)]
+pub struct MultiLinkTracker {
+    servers: HashMap<String, ServerLink>,
+}
+
+impl MultiLinkTracker {
+    /// Drops a server whose connection closed or restarted so stale trouble
+    /// stops holding down the remaining servers.
+    pub fn remove(&mut self, server_id: &str) {
+        self.servers.remove(server_id);
+    }
+
+    /// Feeds cumulative outgoing packet counts for `server_id` and returns the
+    /// combined worst-case report when a loss window completes.
+    pub fn on_totals(
+        &mut self,
+        server_id: &str,
+        now: Instant,
+        received: u32,
+        lost: u32,
+    ) -> Option<LinkReport> {
+        let entry = self.servers.entry(server_id.to_string()).or_default();
+        let loss = entry.tracker.on_totals(received, lost)?;
+        entry.last_loss = Some((now, loss));
+        Some(self.worst(now, true))
+    }
+
+    /// Feeds the latest connection stats for `server_id` and returns a
+    /// Ping-only worst-case report when queueing delay is confirmed or any
+    /// server is tunnelled (or just left the tunnel).
+    pub fn on_stats(
+        &mut self,
+        server_id: &str,
+        now: Instant,
+        rtt_ms: f32,
+        udp_pings: u32,
+        tunnelled: bool,
+    ) -> Option<LinkReport> {
+        let entry = self.servers.entry(server_id.to_string()).or_default();
+        let was_tunnelled = entry.tracker.tunnelled;
+        if tunnelled && !was_tunnelled {
+            entry.tracker.clear_queue();
+        }
+        entry.tracker.tunnelled = tunnelled;
+        let queue = entry.tracker.on_rtt(now, rtt_ms, udp_pings);
+        let any_tunnelled = self.servers.values().any(|s| s.tracker.tunnelled);
+        if queue.is_none() && !any_tunnelled && !was_tunnelled {
+            return None;
+        }
+        Some(self.worst(now, false))
+    }
+
+    fn worst(&self, now: Instant, include_loss: bool) -> LinkReport {
+        self.servers
+            .values()
+            .map(|s| LinkReport {
+                loss_up: if include_loss {
+                    s.last_loss
+                        .filter(|(at, _)| now.saturating_duration_since(*at) <= LINK_FRESH)
+                        .map(|(_, l)| l)
+                } else {
+                    None
+                },
+                queue_ms: s.tracker.confirmed_queue(now),
+                tunnelled: s.tracker.tunnelled,
+            })
+            .reduce(LinkReport::worst)
+            .unwrap_or_default()
     }
 }
 
@@ -297,7 +416,13 @@ impl AutoBitrate {
             self.clean_since = None;
             return self.bps();
         }
-        if loss.is_none() && queue.is_none() {
+        // Ping-only reports (loss_up: None) must never arm clean_since or
+        // climb rungs: only fresh voice loss below LOSS_CLEAN proves speech
+        // gets through cleanly.
+        let Some(l) = loss else {
+            return self.bps();
+        };
+        if !l.is_finite() || l < 0.0 || queue.is_some_and(|q| !q.is_finite()) {
             return self.bps();
         }
 
@@ -487,27 +612,192 @@ mod tests {
     fn queueing_is_measured_against_the_recent_lowest() {
         let t0 = Instant::now();
         let mut t = LinkTracker::default();
-        assert_eq!(t.on_rtt(t0, 50.0), None);
-        assert_eq!(t.on_rtt(at(t0, 5), 60.0), Some(0.0));
-        // The same ping republished is not a new one.
-        assert_eq!(t.on_rtt(at(t0, 6), 60.0), None);
+        assert_eq!(t.on_rtt(t0, 50.0, 1), None);
+        assert_eq!(t.on_rtt(at(t0, 5), 60.0, 2), Some(0.0));
+        // The same ping counter republished is not a new ping.
+        assert_eq!(t.on_rtt(at(t0, 6), 60.0, 2), None);
         // A single spike is not a queue...
-        assert_eq!(t.on_rtt(at(t0, 10), 400.0), Some(10.0));
-        // ...two in a row are.
-        assert_eq!(t.on_rtt(at(t0, 15), 380.0), Some(330.0));
-        // No measurement yet is not a measurement.
-        assert_eq!(t.on_rtt(at(t0, 20), 0.0), None);
+        assert_eq!(t.on_rtt(at(t0, 10), 400.0, 3), Some(10.0));
+        // ...two in a row are, even when the two RTTs are identical.
+        assert_eq!(t.on_rtt(at(t0, 15), 400.0, 4), Some(350.0));
+        assert_eq!(t.confirmed_queue(at(t0, 16)), Some(350.0));
+        // No measurement or non-finite values are ignored without poisoning.
+        assert_eq!(t.on_rtt(at(t0, 20), 0.0, 5), None);
+        assert_eq!(t.on_rtt(at(t0, 21), f32::INFINITY, 6), None);
+        assert_eq!(t.on_rtt(at(t0, 22), f32::NAN, 7), None);
+        assert_eq!(t.on_rtt(at(t0, 25), 55.0, 8), Some(5.0));
     }
 
     #[test]
     fn the_baseline_forgets_old_lows() {
         let t0 = Instant::now();
         let mut t = LinkTracker::default();
-        t.on_rtt(t0, 40.0);
+        t.on_rtt(t0, 40.0, 1);
         // Moved onto a slower network: 300 ms is its empty queue, not a
         // queue, once the old low has aged out.
-        t.on_rtt(at(t0, 200), 300.0);
-        assert_eq!(t.on_rtt(at(t0, 205), 301.0), Some(0.0));
+        t.on_rtt(at(t0, 200), 300.0, 2);
+        assert_eq!(t.on_rtt(at(t0, 205), 301.0, 3), Some(0.0));
+    }
+
+    #[test]
+    fn silent_udp_pongs_do_not_raise_bitrate() {
+        let t0 = Instant::now();
+        let mut a = AutoBitrate::default();
+        let mut links = MultiLinkTracker::default();
+        for i in 1..=13 {
+            let now = at(t0, 5 * i);
+            if let Some(report) = links.on_stats("s1", now, 40.0, i as u32, false) {
+                a.update(now, report);
+            }
+        }
+        assert_eq!(a.bps(), AUTO_START_BPS);
+    }
+
+    #[test]
+    fn ping_only_still_clears_climb_and_steps_down_on_queueing() {
+        let t0 = Instant::now();
+        let mut a = AutoBitrate::default();
+        a.update(t0, CLEAN);
+        // Moderate queue on a ping-only report clears clean_since.
+        assert_eq!(a.update(at(t0, 25), queue(60.0)), AUTO_START_BPS);
+        assert_eq!(a.update(at(t0, 30), CLEAN), AUTO_START_BPS);
+        // Congested queue on a ping-only report steps down immediately.
+        assert_eq!(a.update(at(t0, 35), queue(QUEUE_STEP_DOWN_MS)), 24_000);
+        // Confirmed queue expires after LINK_FRESH.
+        let mut t = LinkTracker::default();
+        t.on_rtt(t0, 40.0, 1);
+        t.on_rtt(at(t0, 5), 120.0, 2);
+        assert_eq!(t.on_rtt(at(t0, 10), 120.0, 3), Some(80.0));
+        assert_eq!(t.confirmed_queue(at(t0, 25)), Some(80.0));
+        assert_eq!(t.confirmed_queue(at(t0, 26)), None);
+    }
+
+    #[test]
+    fn eight_percent_voice_loss_with_clean_pongs_does_not_climb() {
+        let t0 = Instant::now();
+        let mut a = AutoBitrate::default();
+        let mut links = MultiLinkTracker::default();
+        let mut recv = 100u32;
+        let mut lost = 0u32;
+        // Baseline poll.
+        assert!(links.on_totals("s1", t0, recv, lost).is_none());
+        for i in 1..=12 {
+            let now = at(t0, 5 * i);
+            if let Some(report) = links.on_stats("s1", now, 40.0, i as u32, false) {
+                a.update(now, report);
+            }
+            // 230 good + 20 lost = 8% loss per 5 s window.
+            recv += 230;
+            lost += 20;
+            if let Some(report) = links.on_totals("s1", now, recv, lost) {
+                a.update(now, report);
+            }
+        }
+        assert_eq!(a.bps(), AUTO_START_BPS);
+    }
+
+    #[test]
+    fn confirmed_queue_accompanies_clean_voice_and_blocks_climb() {
+        let t0 = Instant::now();
+        let mut a = AutoBitrate::default();
+        let mut links = MultiLinkTracker::default();
+        links.on_totals("s1", t0, 100, 0);
+        links.on_stats("s1", t0, 40.0, 1, false);
+        // Two identical 120 ms pings confirm 80 ms queueing (>= QUEUE_CLEAN_MS).
+        links.on_stats("s1", at(t0, 5), 120.0, 2, false);
+        let stats_report = links.on_stats("s1", at(t0, 10), 120.0, 3, false).unwrap();
+        assert_eq!(stats_report.queue_ms, Some(80.0));
+        a.update(at(t0, 10), stats_report);
+
+        // Even with 0% voice loss, the fresh 80 ms queue stops clean_since.
+        for i in 3..=12 {
+            let now = at(t0, 5 * i);
+            if i <= 10 {
+                links.on_stats("s1", now, 120.0, i as u32 + 1, false);
+            }
+            let report = links.on_totals("s1", now, 100 + 250 * (i as u32 - 2), 0).unwrap();
+            a.update(now, report);
+        }
+        assert_eq!(a.bps(), AUTO_START_BPS);
+    }
+
+    #[test]
+    fn multi_server_worst_stops_clean_second_server_from_climbing() {
+        let t0 = Instant::now();
+        let mut a = AutoBitrate::default();
+        let mut links = MultiLinkTracker::default();
+        // Baselines for both servers.
+        links.on_totals("bad", t0, 100, 0);
+        links.on_totals("good", t0, 100, 0);
+        let mut bad_recv = 100u32;
+        let mut bad_lost = 0u32;
+        let mut good_recv = 100u32;
+
+        for i in 1..=12 {
+            let now = at(t0, 5 * i);
+            bad_recv += 230;
+            bad_lost += 20; // 8% loss
+            if let Some(r) = links.on_totals("bad", now, bad_recv, bad_lost) {
+                a.update(now, r);
+            }
+            good_recv += 250; // 0% loss
+            if let Some(r) = links.on_totals("good", now, good_recv, 0) {
+                a.update(now, r);
+            }
+        }
+        assert_eq!(a.bps(), AUTO_START_BPS);
+
+        // Disconnecting the bad server lets the clean server earn a climb.
+        links.remove("bad");
+        for i in 13..=20 {
+            let now = at(t0, 5 * i);
+            good_recv += 250;
+            let r = links.on_totals("good", now, good_recv, 0).unwrap();
+            a.update(now, r);
+        }
+        assert_eq!(a.bps(), 40_000);
+    }
+
+    #[test]
+    fn multi_server_queueing_on_one_blocks_climb_on_another() {
+        let t0 = Instant::now();
+        let mut a = AutoBitrate::default();
+        let mut links = MultiLinkTracker::default();
+        links.on_totals("slow", t0, 100, 0);
+        links.on_totals("clean", t0, 100, 0);
+        links.on_stats("slow", t0, 40.0, 1, false);
+        links.on_stats("clean", t0, 40.0, 1, false);
+
+        for i in 1..=10 {
+            let now = at(t0, 5 * i);
+            if let Some(r) = links.on_stats("slow", now, 120.0, i as u32 + 1, false) {
+                a.update(now, r);
+            }
+            if let Some(r) = links.on_stats("clean", now, 40.0, i as u32 + 1, false) {
+                a.update(now, r);
+            }
+            let r = links.on_totals("clean", now, 100 + 250 * i as u32, 0).unwrap();
+            a.update(now, r);
+        }
+        assert_eq!(a.bps(), AUTO_START_BPS);
+    }
+
+    #[test]
+    fn link_report_worst_combines_each_signal() {
+        let a = LinkReport {
+            loss_up: Some(0.01),
+            queue_ms: Some(80.0),
+            tunnelled: false,
+        };
+        let b = LinkReport {
+            loss_up: Some(0.08),
+            queue_ms: None,
+            tunnelled: true,
+        };
+        let w = a.worst(b);
+        assert_eq!(w.loss_up, Some(0.08));
+        assert_eq!(w.queue_ms, Some(80.0));
+        assert!(w.tunnelled);
     }
 
     #[test]

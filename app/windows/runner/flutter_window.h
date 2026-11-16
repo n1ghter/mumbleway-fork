@@ -6,7 +6,10 @@
 #include <flutter/flutter_view_controller.h>
 #include <flutter/method_channel.h>
 
+#include <cstdint>
 #include <memory>
+#include <unordered_map>
+#include <vector>
 
 #include "win32_window.h"
 
@@ -32,6 +35,18 @@ class FlutterWindow : public Win32Window {
   // answer: whether a call is up, and whether anybody is looking at us.
   void ApplyPowerThrottling();
 
+  // Registers or replaces system-wide hotkeys for the bound Flutter keyIds.
+  void SetGlobalHotkeys(const std::vector<int64_t>& key_ids);
+  void UnregisterGlobalHotkeys();
+  void InvokeGlobalHotkey(int64_t key_id, bool pressed);
+  void PollReleasedHotkeys();
+
+  struct RegisteredHotkey {
+    int id;
+    UINT vk;
+    int64_t key_id;
+  };
+
   // The project to run.
   flutter::DartProject project_;
 
@@ -47,6 +62,11 @@ class FlutterWindow : public Win32Window {
 
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
       power_channel_;
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
+      buttons_channel_;
+  std::unordered_map<int, RegisteredHotkey> registered_hotkeys_;
+  std::vector<RegisteredHotkey> held_hotkeys_;
+  bool hotkey_timer_active_ = false;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

@@ -18,6 +18,9 @@ enum FloatingKind {
   /// controls and offers exactly three of them.
   iosPictureInPicture,
 
+  /// An always-on-top panel on macOS. Arbitrary buttons, no permission needed.
+  floatingWindow,
+
   none,
 }
 
@@ -49,18 +52,16 @@ class OverlayBridge {
 
   bool get isShowing => _showing;
 
-  /// Offered only where the app is genuinely hidden behind something else.
+  /// Offered on phones and macOS where a floating call control window is built.
   ///
-  /// Not on macOS or Windows: there the app is a window among windows, already
-  /// visible next to whatever else is open and a click away when it is not, so
-  /// a second always-on-top copy of its controls buys nothing and costs screen.
-  /// The case for one is a phone, where leaving the app means the app is gone
-  /// and the rider cannot go looking for it at 100 km/h.
+  /// Not on Windows: there the app is a window among windows with no native
+  /// floating panel implementation.
   FloatingKind get kind {
     if (kIsWeb) return FloatingKind.none;
     try {
       if (Platform.isAndroid) return FloatingKind.androidOverlay;
       if (Platform.isIOS) return FloatingKind.iosPictureInPicture;
+      if (Platform.isMacOS) return FloatingKind.floatingWindow;
     } catch (_) {
       // Platform is unavailable under some test harnesses.
     }

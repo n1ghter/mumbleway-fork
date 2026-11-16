@@ -68,6 +68,14 @@ class MainFlutterWindow: NSWindow {
         panel.hide()
         result(true)
 
+      case "phrases", "setPhrases":
+        panel.setPhrases(call.arguments as? [String: String] ?? [:])
+        result(true)
+
+      case "avatars":
+        panel.setAvatars(call.arguments as? [String: Any] ?? [:])
+        result(true)
+
       case "update":
         guard let arguments = call.arguments as? [String: Any] else {
           result(false)
@@ -91,9 +99,8 @@ class MainFlutterWindow: NSWindow {
     }
   }
 
-  /// Kept apart from the overlay channel, which this platform registers but
-  /// never hears from — Dart offers no floating window on a desktop, where the
-  /// app is a window among windows. The power question is asked everywhere.
+  /// Kept apart from the overlay channel, which is optional UI while the
+  /// power assertion applies whenever a call is active on any platform.
   private func registerPowerChannel(with messenger: FlutterBinaryMessenger) {
     let channel = FlutterMethodChannel(
       name: "mumbleway/power", binaryMessenger: messenger)

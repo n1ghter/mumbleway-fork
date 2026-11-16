@@ -1450,6 +1450,8 @@ class _OverlayTileState extends State<_OverlayTile> {
         return L.of(context).floatingAndroidBody;
       case FloatingKind.iosPictureInPicture:
         return L.of(context).floatingIosBody;
+      case FloatingKind.floatingWindow:
+        return L.of(context).floatingMacosBody;
       case FloatingKind.none:
         return L.of(context).notAvailableHere;
     }

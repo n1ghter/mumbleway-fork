@@ -484,7 +484,23 @@ void main() {
       isFalse,
     );
     expect(OverlayBridge.hasDeafenFor(FloatingKind.androidOverlay), isTrue);
+    expect(OverlayBridge.hasDeafenFor(FloatingKind.floatingWindow), isTrue);
     expect(OverlayBridge.hasDeafenFor(FloatingKind.none), isFalse);
+  });
+
+  test('floating window kind matches platform support', () {
+    final expected = Platform.isAndroid
+        ? FloatingKind.androidOverlay
+        : Platform.isIOS
+        ? FloatingKind.iosPictureInPicture
+        : Platform.isMacOS
+        ? FloatingKind.floatingWindow
+        : FloatingKind.none;
+    expect(OverlayBridge.instance.kind, expected);
+    expect(
+      OverlayBridge.instance.isSupported,
+      Platform.isAndroid || Platform.isIOS || Platform.isMacOS,
+    );
   });
 
   group('audio session', () {

@@ -2743,6 +2743,12 @@ abstract class L {
   /// **'Picture in Picture, appearing when you leave the app. The system allows three buttons: play/pause talks, skip back mutes, skip forward hangs up (twice to confirm).'**
   String get floatingIosBody;
 
+  /// No description provided for @floatingMacosBody.
+  ///
+  /// In en, this message translates to:
+  /// **'A small always-on-top panel with talk, mute, deafen and hang up.'**
+  String get floatingMacosBody;
+
   /// No description provided for @actionPushToTalkHold.
   ///
   /// In en, this message translates to:

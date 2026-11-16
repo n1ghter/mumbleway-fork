@@ -93,6 +93,7 @@ final class FloatingPanel: NSObject {
   private var deafened = false
   private var speaking = false
   private var names: [String] = []
+  private var phrases: [String: String] = [:]
 
   init(channel: FlutterMethodChannel) {
     self.channel = channel
@@ -108,7 +109,23 @@ final class FloatingPanel: NSObject {
   }
 
   func hide() {
+    flashTimer?.invalidate()
+    flashTimer = nil
     panel?.orderOut(nil)
+  }
+
+  func setPhrases(_ phrases: [String: String]) {
+    self.phrases = phrases
+    refresh()
+  }
+
+  func setAvatars(_ avatars: [String: Any]) {
+    // The compact macOS panel lists speaker names without avatar images.
+  }
+
+  private func phrase(_ key: String, _ fallback: String) -> String {
+    guard let value = phrases[key], !value.isEmpty else { return fallback }
+    return value
   }
 
   func update(
@@ -144,6 +161,7 @@ final class FloatingPanel: NSObject {
     panel.title = "MumbleWay"
     panel.titlebarAppearsTransparent = true
     panel.isFloatingPanel = true
+    panel.isReleasedWhenClosed = false
     panel.level = .floating
     panel.hidesOnDeactivate = false
     panel.isMovableByWindowBackground = true
@@ -228,16 +246,16 @@ final class FloatingPanel: NSObject {
     guard panel != nil else { return }
 
     if !connected {
-      statusLabel.stringValue = "Not connected"
+      statusLabel.stringValue = phrase("pipNotConnected", "Not connected")
       statusLabel.textColor = .secondaryLabelColor
     } else if transmitting {
-      statusLabel.stringValue = "Talking"
+      statusLabel.stringValue = phrase("pipTalking", "Talking")
       statusLabel.textColor = .systemRed
     } else if deafened {
-      statusLabel.stringValue = "Deafened"
+      statusLabel.stringValue = phrase("pipDeafened", "Deafened")
       statusLabel.textColor = .systemOrange
     } else if muted {
-      statusLabel.stringValue = "Muted"
+      statusLabel.stringValue = phrase("pipMuted", "Muted")
       statusLabel.textColor = .systemOrange
     } else {
       statusLabel.stringValue = "Listening"
@@ -313,6 +331,8 @@ final class FloatingPanel: NSObject {
 
 extension FloatingPanel: NSWindowDelegate {
   func windowWillClose(_ notification: Notification) {
+    flashTimer?.invalidate()
+    flashTimer = nil
     // Closing the panel turns the setting off rather than leaving a switch on
     // for a window that is no longer there.
     channel.invokeMethod("dismissed", arguments: nil)

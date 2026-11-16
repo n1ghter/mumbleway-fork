@@ -1476,6 +1476,10 @@ class LEn extends L {
       'Picture in Picture, appearing when you leave the app. The system allows three buttons: play/pause talks, skip back mutes, skip forward hangs up (twice to confirm).';
 
   @override
+  String get floatingMacosBody =>
+      'A small always-on-top panel with talk, mute, deafen and hang up.';
+
+  @override
   String get actionPushToTalkHold => 'Push to talk (hold)';
 
   @override

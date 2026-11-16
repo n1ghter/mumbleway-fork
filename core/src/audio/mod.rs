@@ -32,7 +32,7 @@ pub mod testsig;
 pub mod timing;
 pub mod waveform;
 
-pub use adaptive::{BitrateMode, LinkReport, LinkTracker};
+pub use adaptive::{BitrateMode, LinkReport, LinkTracker, MultiLinkTracker};
 pub use codec::{Quality, VoiceDecoder, VoiceEncoder};
 pub use deepfilter::Enhancer;
 pub use denoise::{CaptureProcessor, NoiseProfile};

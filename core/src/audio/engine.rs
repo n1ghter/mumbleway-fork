@@ -1492,12 +1492,9 @@ impl AudioShared {
             inbound_loss_pct: AtomicU32::new(0),
             loss_mark: Mutex::new((0, 0)),
             bandwidth_cap_bps: AtomicU32::new(0),
-            preferred_bitrate_bps: AtomicU32::new(super::bandwidth::preferred_bps()),
-            bitrate_mode: Mutex::new((
-                BitrateMode::Fixed(super::bandwidth::preferred_bps()),
-                AutoBitrate::default(),
-            )),
-            encoder_bitrate_bps: AtomicU32::new(super::bandwidth::preferred_bps()),
+            preferred_bitrate_bps: AtomicU32::new(super::adaptive::AUTO_START_BPS),
+            bitrate_mode: Mutex::new((BitrateMode::Auto, AutoBitrate::default())),
+            encoder_bitrate_bps: AtomicU32::new(super::adaptive::AUTO_START_BPS),
             underrun_samples: AtomicU64::new(0),
             capture_dropped_samples: AtomicU64::new(0),
             active_speakers: AtomicU32::new(0),
@@ -4750,6 +4747,20 @@ mod tests {
         // Back to Auto resumes where the link left it, not from the start.
         shared.set_bitrate_mode(BitrateMode::Auto);
         assert_eq!(shared.bitrate_budget().bitrate_bps, after);
+    }
+
+    #[test]
+    fn shared_starts_in_auto_at_auto_start_bps() {
+        let shared = AudioShared::new();
+        assert_eq!(shared.bitrate_mode(), BitrateMode::Auto);
+        assert_eq!(
+            shared.bitrate_budget().bitrate_bps,
+            super::super::adaptive::AUTO_START_BPS
+        );
+        assert_eq!(
+            shared.encoder_bitrate_bps(),
+            super::super::adaptive::AUTO_START_BPS
+        );
     }
 
     #[test]

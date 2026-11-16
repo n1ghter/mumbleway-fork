@@ -5,6 +5,7 @@
 //! and corporate networks block or aggressively NAT UDP though, so we probe with
 //! pings and fall back to tunnelling through TLS when the probe fails.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,9 @@ pub const UDP_STALE_AFTER: Duration = Duration::from_secs(12);
 
 /// Largest datagram we will accept; Mumble audio is far smaller.
 const MAX_DATAGRAM: usize = 2048;
+
+/// Number of recent UDP ping timestamps kept for exact RTT matching.
+const MAX_PENDING_PINGS: usize = 8;
 
 /// Something that arrived on the UDP socket.
 #[derive(Debug)]
@@ -109,6 +113,7 @@ pub struct VoiceSocket {
     last_pong: Option<Instant>,
     last_ping_sent: Option<Instant>,
     bound_at: Instant,
+    pending_pings: VecDeque<(u64, Instant)>,
     established: bool,
     /// When decryption last worked, and when a resync was last asked for.
     resync: crate::crypto::ResyncGuard,
@@ -152,6 +157,7 @@ impl VoiceSocket {
             last_pong: None,
             last_ping_sent: None,
             bound_at: now,
+            pending_pings: VecDeque::with_capacity(MAX_PENDING_PINGS),
             established: false,
             resync: crate::crypto::ResyncGuard::new(now),
         })
@@ -165,7 +171,7 @@ impl VoiceSocket {
     /// Whether UDP looks usable right now.
     pub fn is_healthy(&self, now: Instant) -> bool {
         match self.last_pong {
-            Some(t) => now.duration_since(t) < UDP_STALE_AFTER,
+            Some(t) => now.saturating_duration_since(t) < UDP_STALE_AFTER,
             None => false,
         }
     }
@@ -189,7 +195,7 @@ impl VoiceSocket {
 
     /// Our encrypt nonce, which the server asks for when *its* decryption has
     /// lost step.
-    pub fn encrypt_iv(&self) -> &[u8] {
+    pub fn encrypt_iv(&self) -> [u8; 16] {
         self.crypt.encrypt_iv()
     }
 
@@ -206,20 +212,34 @@ impl VoiceSocket {
     /// Encrypts and sends a voice packet.
     pub async fn send_voice(&mut self, packet: &VoicePacket) -> Result<()> {
         let plain = packet.encode_outgoing();
+        let saved_iv = self.crypt.encrypt_iv();
         let sealed = self.crypt.encrypt(&plain)?;
+        if let Err(e) = self.socket.send(&sealed).await {
+            // Undo the encrypt IV advance so an unsent datagram does not desync the cipher.
+            self.crypt.restore_encrypt_iv(saved_iv);
+            return Err(e.into());
+        }
         super::stats::note_bytes_out(sealed.len());
         super::stats::note_voice_out();
-        self.socket.send(&sealed).await?;
         Ok(())
     }
 
     /// Sends an encrypted ping carrying `timestamp`.
     pub async fn send_ping(&mut self, timestamp: u64) -> Result<()> {
         let plain = audio_packet::encode_ping(timestamp);
+        let saved_iv = self.crypt.encrypt_iv();
         let sealed = self.crypt.encrypt(&plain)?;
+        if let Err(e) = self.socket.send(&sealed).await {
+            self.crypt.restore_encrypt_iv(saved_iv);
+            return Err(e.into());
+        }
         super::stats::note_bytes_out(sealed.len());
-        self.socket.send(&sealed).await?;
-        self.last_ping_sent = Some(Instant::now());
+        let now = Instant::now();
+        self.last_ping_sent = Some(now);
+        if self.pending_pings.len() >= MAX_PENDING_PINGS {
+            self.pending_pings.pop_front();
+        }
+        self.pending_pings.push_back((timestamp, now));
         Ok(())
     }
 
@@ -251,17 +271,22 @@ impl VoiceSocket {
         };
 
         if audio_packet::is_ping(&plain) {
-            let echoed = audio_packet::decode_ping(&plain)?;
+            let Ok(echoed) = audio_packet::decode_ping(&plain) else {
+                return Ok(UdpEvent::Rejected("malformed ping packet"));
+            };
             let now = Instant::now();
             self.last_pong = Some(now);
             self.established = true;
-            let rtt = self
-                .last_ping_sent
+            let sent_at = self
+                .pending_pings
+                .iter()
+                .position(|(ts, _)| *ts == echoed)
+                .and_then(|idx| self.pending_pings.remove(idx))
+                .map(|(_, sent)| sent)
+                .or(self.last_ping_sent);
+            let rtt = sent_at
                 .map(|s| now.saturating_duration_since(s))
                 .unwrap_or_default();
-            // The server echoes our timestamp verbatim, so a mismatch means a
-            // stale reply; we still count it as liveness.
-            let _ = echoed;
             return Ok(UdpEvent::Pong { rtt });
         }
 
@@ -328,7 +353,7 @@ mod tests {
         // What a rebind after a socket error relies on: the cipher handed back
         // by the dead socket goes into the new one unchanged, nonce and all.
         let (a, _) = crypt_pair();
-        let iv = *a.encrypt_iv();
+        let iv = a.encrypt_iv();
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let first = VoiceSocket::bind(peer.local_addr().unwrap(), a)
             .await
@@ -338,7 +363,7 @@ mod tests {
             Ok(s) => s,
             Err((e, _)) => panic!("rebinding failed: {e}"),
         };
-        assert_eq!(second.encrypt_iv(), &iv);
+        assert_eq!(second.encrypt_iv(), iv);
     }
 
     fn crypt_pair() -> (CryptState, CryptState) {
@@ -496,7 +521,7 @@ mod tests {
         let mut new_server = CryptState::new(&key, &server_iv, &client_iv).unwrap();
 
         client.set_crypt(new_client);
-        assert_eq!(client.encrypt_iv(), &client_iv);
+        assert_eq!(client.encrypt_iv(), client_iv);
         let probe = before_sleep + crate::crypto::resync::RESYNC_AFTER;
         assert!(!client.resync.should_request(probe));
 
@@ -516,5 +541,109 @@ mod tests {
         server.send_to(&fresh, from).await.unwrap();
         let ev = client.recv().await.unwrap();
         assert!(matches!(ev, UdpEvent::Pong { .. }));
+    }
+
+    #[tokio::test]
+    async fn malformed_ping_is_rejected_without_killing_the_socket() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (client_crypt, mut server_crypt) = crypt_pair();
+        let mut client = VoiceSocket::bind(server_addr, client_crypt).await.unwrap();
+
+        client.send_ping(1).await.unwrap();
+        let mut buf = [0u8; 2048];
+        let (n, from) = server.recv_from(&mut buf).await.unwrap();
+        server_crypt.decrypt(&buf[..n]).unwrap();
+
+        // Valid OCB2 tag over a ping header missing its varint timestamp.
+        let malformed = [audio_packet::TYPE_PING << 5];
+        let sealed = server_crypt.encrypt(&malformed).unwrap();
+        server.send_to(&sealed, from).await.unwrap();
+        assert!(matches!(
+            client.recv().await.unwrap(),
+            UdpEvent::Rejected("malformed ping packet")
+        ));
+
+        // Socket must remain healthy and keep processing valid packets.
+        let ok_ping = audio_packet::encode_ping(1);
+        let sealed = server_crypt.encrypt(&ok_ping).unwrap();
+        server.send_to(&sealed, from).await.unwrap();
+        assert!(matches!(
+            client.recv().await.unwrap(),
+            UdpEvent::Pong { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_voice_failure_restores_encrypt_iv() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (client_crypt, mut server_crypt) = crypt_pair();
+        let mut client = VoiceSocket::bind(server_addr, client_crypt).await.unwrap();
+
+        let iv_before = client.crypt.encrypt_iv();
+        // Exceeds max UDP datagram size (65,507 B), forcing socket.send() to error.
+        let oversized = VoicePacket::speech(1, vec![0xAAu8; 70_000], false);
+        assert!(client.send_voice(&oversized).await.is_err());
+        assert_eq!(client.crypt.encrypt_iv(), iv_before);
+
+        // Next genuine voice packet still decrypts cleanly on the peer.
+        let normal = VoicePacket::speech(2, vec![1, 2, 3, 4], false);
+        client.send_voice(&normal).await.unwrap();
+        let mut buf = [0u8; 2048];
+        let (n, _) = server.recv_from(&mut buf).await.unwrap();
+        assert!(server_crypt.decrypt(&buf[..n]).is_ok());
+        assert_eq!(server_crypt.stats().lost, 0);
+    }
+
+    #[tokio::test]
+    async fn late_pong_matches_original_ping_and_bounds_queue() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (client_crypt, mut server_crypt) = crypt_pair();
+        let mut client = VoiceSocket::bind(server_addr, client_crypt).await.unwrap();
+
+        client.send_ping(101).await.unwrap();
+        let after_first = Instant::now();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        client.send_ping(202).await.unwrap();
+        let after_second = Instant::now();
+
+        let mut buf = [0u8; 2048];
+        let (n1, from) = server.recv_from(&mut buf).await.unwrap();
+        server_crypt.decrypt(&buf[..n1]).unwrap();
+        let (n2, _) = server.recv_from(&mut buf).await.unwrap();
+        server_crypt.decrypt(&buf[..n2]).unwrap();
+
+        // Echo the older ping (101) after ping 202 was already sent.
+        let earlier_than_pong = Instant::now();
+        let echo1 = server_crypt.encrypt(&audio_packet::encode_ping(101)).unwrap();
+        server.send_to(&echo1, from).await.unwrap();
+        match client.recv().await.unwrap() {
+            UdpEvent::Pong { rtt } => {
+                assert!(
+                    rtt >= after_second.duration_since(after_first),
+                    "late pong RTT {rtt:?} must reflect original ping 101, not ping 202"
+                );
+            }
+            other => panic!("expected Pong, got {other:?}"),
+        }
+        // An Instant captured slightly before recv() must not panic in is_healthy().
+        assert!(client.is_healthy(earlier_than_pong));
+
+        // Unmatched timestamp falls back to last_ping_sent without panicking.
+        let echo_unknown = server_crypt.encrypt(&audio_packet::encode_ping(999)).unwrap();
+        server.send_to(&echo_unknown, from).await.unwrap();
+        assert!(matches!(
+            client.recv().await.unwrap(),
+            UdpEvent::Pong { .. }
+        ));
+
+        // Pending ping history stays capped at MAX_PENDING_PINGS.
+        for ts in 1_000..1_012u64 {
+            client.send_ping(ts).await.unwrap();
+        }
+        assert_eq!(client.pending_pings.len(), MAX_PENDING_PINGS);
+        assert_eq!(client.pending_pings.front().map(|(t, _)| *t), Some(1_004));
     }
 }

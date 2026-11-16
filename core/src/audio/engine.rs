@@ -1344,7 +1344,11 @@ pub fn render_cue(cue: AudioCue) -> Vec<f32> {
 /// which is what gives the release cue its squelch tail — a pure tone alone
 /// sounds like a doorbell rather than a radio.
 fn render_segments(segments: &[(f32, u32)], amplitude: f32) -> Vec<f32> {
-    let mut out = Vec::new();
+    let total: usize = segments
+        .iter()
+        .map(|&(_, millis)| (SAMPLE_RATE as u64 * millis as u64 / 1000) as usize)
+        .sum();
+    let mut out = Vec::with_capacity(total);
     // Deterministic, so a cue sounds identical every time and the tests can
     // assert on it.
     let mut rng: u32 = 0x9E37_79B9;
@@ -1378,30 +1382,67 @@ fn render_segments(segments: &[(f32, u32)], amplitude: f32) -> Vec<f32> {
     out
 }
 
+/// How long `"mw-preview"` keeps the second capture chain alive after the last
+/// block before dropping the ~40 MB ONNX model and exiting.
+const PREVIEW_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Runs previewed audio through a capture chain of its own.
 ///
 /// Owns the chain outright, because `DfTract` holds `Rc`s and cannot be shared
 /// between threads at all. Ends when the sender is dropped — which is what
-/// [`AudioShared::preview_reset_chain`] does — or when a newer generation has
-/// taken over.
+/// [`AudioShared::preview_reset_chain`] does — when a newer generation has
+/// taken over, or after [`PREVIEW_IDLE_TIMEOUT`] of inactivity.
 fn preview_worker(
     shared: Arc<AudioShared>,
     rx: std::sync::mpsc::Receiver<Vec<f32>>,
     generation: u64,
 ) {
-    let mut chain = PreviewChain::new(shared.noise_profile());
+    preview_worker_with_timeout(shared, rx, generation, PREVIEW_IDLE_TIMEOUT);
+}
+
+fn preview_worker_with_timeout(
+    shared: Arc<AudioShared>,
+    rx: std::sync::mpsc::Receiver<Vec<f32>>,
+    generation: u64,
+    idle_timeout: Duration,
+) {
+    let mut chain: Option<PreviewChain> = None;
     let mut out: Vec<f32> = Vec::with_capacity(FRAME_SIZE * 8);
 
-    while let Ok(input) = rx.recv() {
+    loop {
+        let input = match rx.recv_timeout(idle_timeout) {
+            Ok(input) => input,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Drop the heavy Enhancer and CaptureProcessor outside the lock.
+                chain = None;
+                let mut guard = shared.preview_tx.lock();
+                if shared.preview_generation.load(Ordering::Acquire) != generation
+                    || !shared.is_running()
+                {
+                    break;
+                }
+                match rx.try_recv() {
+                    Ok(input) => input,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        *guard = None;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        };
         let handed = input.len();
         // Checked before the work and again before the queue: a listener who
         // seeks while a block is in flight must not hear where they were.
         if shared.preview_generation.load(Ordering::Acquire) != generation {
             break;
         }
-        chain.set_profile(shared.noise_profile());
+        let profile = shared.noise_profile();
+        let active = chain.get_or_insert_with(|| PreviewChain::new(profile));
+        active.set_profile(profile);
         out.clear();
-        chain.process(&input, &mut out);
+        active.process(&input, &mut out);
 
         if shared.preview_generation.load(Ordering::Acquire) == generation {
             let mut q = shared.preview_queue.lock();
@@ -2571,6 +2612,9 @@ impl AudioShared {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
+        // Tear down any active preview worker immediately rather than waiting
+        // for its idle timeout, breaking the `Arc<AudioShared>` reference cycle.
+        self.preview_reset_chain();
         // Both threads are asleep on a condvar by design, so setting the flag
         // alone leaves them there until their timeout expires. Waking them is
         // what makes shutdown prompt rather than eventual.
@@ -4314,11 +4358,26 @@ where
             // Only in voice-activated mode. The other two modes have no
             // threshold to be late for, and delaying them would buy nothing
             // and cost 80 ms of every conversation.
+            let muted = shared.is_muted();
+            if muted {
+                // Mute is immediate and absolute. Fading out of it would send
+                // the tail of whatever the rider muted themselves to stop
+                // sending, which is the one thing mute must never do.
+                hold_left = 0;
+                fade_left = 0;
+            }
             let mut priming = false;
             if mode == TransmitMode::VoiceActivity {
-                priming = !onset_delay.shift(&mut block);
-            } else if !onset_delay.is_empty() {
-                onset_delay.clear();
+                // Keep advancing while speech or its hangover/fade is active so
+                // the tail plays out untouched; refill toward 240 ms once shut.
+                let gate_active = !muted && (open || hold_left > 0 || fade_left > 0);
+                priming = !onset_delay.shift_with_speech(&mut block, gate_active);
+            } else {
+                hold_left = 0;
+                fade_left = 0;
+                if !onset_delay.is_empty() {
+                    onset_delay.clear();
+                }
             }
             // What the delay line is actually holding right now, which is no
             // longer a constant — the pay-down drains it from 240 ms towards
@@ -4327,13 +4386,9 @@ where
             let held_samples = onset_delay.held_samples();
 
             let allowed = if priming {
+                block.fill(0.0);
                 false
-            } else if shared.is_muted() {
-                // Mute is immediate and absolute. Fading out of it would send
-                // the tail of whatever the rider muted themselves to stop
-                // sending, which is the one thing mute must never do.
-                hold_left = 0;
-                fade_left = 0;
+            } else if muted {
                 false
             } else if mode == TransmitMode::VoiceActivity {
                 // Voice activation cuts on a threshold, and a threshold lands
@@ -6906,5 +6961,47 @@ mod tests {
         }
         mix_speakers(&shared, &mut scratch, &mut mixed);
         assert_eq!(mixed.len(), FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn preview_worker_drops_chain_on_idle_timeout_and_reinitializes() {
+        let shared = Arc::new(AudioShared::new());
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let generation = shared.preview_generation.load(Ordering::Acquire);
+        *shared.preview_tx.lock() = Some(tx);
+
+        let timeout = Duration::from_millis(30);
+        let worker_shared = Arc::clone(&shared);
+        let handle = std::thread::spawn(move || {
+            preview_worker_with_timeout(worker_shared, rx, generation, timeout);
+        });
+
+        let samples = vec![0.0f32; FRAME_SIZE * 2];
+        assert_eq!(shared.preview_push_processed(&samples), samples.len());
+        handle.join().unwrap();
+
+        assert!(
+            shared.preview_tx.lock().is_none(),
+            "idle timeout should clear preview_tx and drop the preview chain"
+        );
+        assert_eq!(shared.preview_queued(), samples.len());
+
+        // Subsequent pushes lazily respawn the worker and chain.
+        shared.preview_clear();
+        assert_eq!(shared.preview_push_processed(&samples), samples.len());
+        assert!(shared.preview_tx.lock().is_some());
+        shared.stop();
+        assert!(shared.preview_tx.lock().is_none());
+    }
+
+    #[test]
+    fn render_segments_matches_exact_sample_count() {
+        let segments = [(440.0, 120), (0.0, 250), (-1.0, 40)];
+        let expected: usize = segments
+            .iter()
+            .map(|&(_, ms)| (SAMPLE_RATE as u64 * ms as u64 / 1000) as usize)
+            .sum();
+        let pcm = render_segments(&segments, 0.25);
+        assert_eq!(pcm.len(), expected);
     }
 }

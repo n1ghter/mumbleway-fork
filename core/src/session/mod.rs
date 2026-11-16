@@ -744,6 +744,7 @@ impl Session {
         if stale > 0 {
             tracing::info!("dropped {stale} voice frames queued while not connected");
         }
+        let mut was_silenced = state.server_silences_us();
 
         let mut ping_timer = tokio::time::interval(PING_INTERVAL);
         ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -862,7 +863,19 @@ impl Session {
                                 _ => false,
                             };
                             if !sent_over_udp {
+                                // A stalled TCP write lets the 64-frame queue
+                                // fill behind it; drop the backlog instead of
+                                // bursting 1.28 s of stale audio when it clears.
+                                let t0 = Instant::now();
                                 writer.send_tunnel(&packet.encode_outgoing()).await?;
+                                if t0.elapsed() >= Duration::from_millis(500) {
+                                    let dropped = discard_queued(&mut self.audio.outgoing);
+                                    if dropped > 0 {
+                                        tracing::warn!(
+                                            "TCP stalled; dropped {dropped} stale frames"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1048,6 +1061,18 @@ impl Session {
                     }
                 }
             }
+
+            // Frames captured while the server silenced us (or right as that
+            // lifts) may sit in the outgoing queue; drop them before the next
+            // select iteration can send them in a burst.
+            let silenced = state.server_silences_us();
+            if was_silenced && !silenced {
+                let dropped = discard_queued(&mut self.audio.outgoing);
+                if dropped > 0 {
+                    tracing::info!("dropped {dropped} voice frames queued while silenced");
+                }
+            }
+            was_silenced = silenced;
         }
     }
 
@@ -2403,5 +2428,28 @@ mod tests {
         drop(tx);
         assert_eq!(discard_queued(&mut rx), 1);
         assert_eq!(discard_queued(&mut rx), 0);
+    }
+
+    #[tokio::test]
+    async fn discard_queued_clears_pending_frames_and_leaves_channel_usable() {
+        let (tx, mut rx) = mpsc::channel::<(u64, Vec<u8>, bool)>(8);
+        for seq in 0..5 {
+            tx.try_send((seq, vec![0u8; 20], seq == 4)).unwrap();
+        }
+        assert_eq!(discard_queued(&mut rx), 5);
+        assert!(rx.try_recv().is_err());
+
+        // Subsequent frames flow through normally without stale backlog.
+        tx.send((5, vec![2u8; 20], false)).await.unwrap();
+        tx.send((6, vec![3u8; 20], true)).await.unwrap();
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.0, 5);
+        assert_eq!(first.1, vec![2u8; 20]);
+        assert!(!first.2);
+        let second = rx.recv().await.unwrap();
+        assert_eq!(second.0, 6);
+        assert_eq!(second.1, vec![3u8; 20]);
+        assert!(second.2);
+        assert!(rx.try_recv().is_err());
     }
 }

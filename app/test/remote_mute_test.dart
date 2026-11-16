@@ -92,6 +92,71 @@ void main() {
     });
   });
 
+  group('pocket mode interaction with local unmute', () {
+    test('local unmute notifies the engine even while capture is paused', () {
+      final state = AppState();
+      addTearDown(state.dispose);
+      final calls = <bool>[];
+      state.onMicrophoneMutedForTest = calls.add;
+
+      // Remotely muted while capturing, then pocket mode pauses capture.
+      state.onEvent(
+        const AppEvent.remoteMuted(serverId: 's', muted: true, by: 'Anna'),
+      );
+      expect(state.muted, isTrue);
+      state.setCapturingForTest(capturing: false);
+      expect(state.effectivelyMuted, isTrue);
+      calls.clear();
+
+      // Unmuting by hand while capture is paused must send `false` first so
+      // the core's RemoteMuteGuard revokes the muter's 10-minute undo token,
+      // before `_publishMute` restores the effective capture mute (`true`).
+      state.toggleMute();
+      expect(state.muted, isFalse);
+      expect(state.effectivelyMuted, isTrue);
+      expect(calls, [false, true]);
+    });
+
+    test('undeafening while capture is paused also notifies the engine', () {
+      final state = AppState();
+      addTearDown(state.dispose);
+      final calls = <bool>[];
+      state.onMicrophoneMutedForTest = calls.add;
+
+      state.setCapturingForTest(capturing: false);
+      state.toggleDeafen();
+      expect(state.deafened, isTrue);
+      expect(state.muted, isTrue);
+      calls.clear();
+
+      state.toggleDeafen();
+      expect(state.deafened, isFalse);
+      expect(state.muted, isFalse);
+      expect(state.effectivelyMuted, isTrue);
+      expect(calls, [false, true]);
+    });
+
+    test('remote unmute while capture is paused does not send local false', () {
+      final state = AppState();
+      addTearDown(state.dispose);
+      final calls = <bool>[];
+      state.onMicrophoneMutedForTest = calls.add;
+
+      state.onEvent(
+        const AppEvent.remoteMuted(serverId: 's', muted: true, by: 'Anna'),
+      );
+      state.setCapturingForTest(capturing: false);
+      calls.clear();
+
+      state.onEvent(
+        const AppEvent.remoteMuted(serverId: 's', muted: false, by: 'Anna'),
+      );
+      expect(state.muted, isFalse);
+      expect(state.effectivelyMuted, isTrue);
+      expect(calls, [true]);
+    });
+  });
+
   group('allowing other riders to unmute', () {
     test('is off for a fresh install', () {
       // A mute request carries no credential, so opening somebody's

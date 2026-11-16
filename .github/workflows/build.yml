@@ -347,7 +347,7 @@ jobs:
       - name: Report signing status
         shell: pwsh
         run: |
-          if ('${{ env.SIGNPATH_API_TOKEN }}' -eq '') {
+          if ([string]::IsNullOrEmpty($env:SIGNPATH_API_TOKEN)) {
             Write-Host "::notice::SIGNPATH_API_TOKEN is not set - this build is UNSIGNED."
           } else {
             Write-Host "::notice::Windows build signed via SignPath."

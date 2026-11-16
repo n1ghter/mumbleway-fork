@@ -408,9 +408,11 @@ jobs:
 
       - name: Install provisioning profile
         if: steps.gate.outputs.ready == 'true'
+        env:
+          APPLE_PROVISIONING_PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE }}
         run: |
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          echo "${{ secrets.APPLE_PROVISIONING_PROFILE }}" | base64 -d \
+          echo "$APPLE_PROVISIONING_PROFILE" | base64 -d \
             > ~/Library/MobileDevice/Provisioning\ Profiles/mumbleway.mobileprovision
 
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
@@ -427,10 +429,12 @@ jobs:
       # "Signing for Runner requires a development team".
       - name: Point the release build at the distribution profile
         if: steps.gate.outputs.ready == 'true'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           /usr/libexec/PlistBuddy -c \
-            "Set :teamID ${{ secrets.APPLE_TEAM_ID }}" app/ios/ExportOptions.plist
+            "Set :teamID $APPLE_TEAM_ID" app/ios/ExportOptions.plist
 
           profile=$(ls ~/Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision | head -1)
           security cms -D -i "$profile" > /tmp/pp.plist
@@ -449,7 +453,7 @@ jobs:
           # ask Apple to create, which a runner cannot do and which is not what
           # a store build wants anyway.
           cat >> app/ios/Flutter/Release.xcconfig <<EOF
-          DEVELOPMENT_TEAM=${{ secrets.APPLE_TEAM_ID }}
+          DEVELOPMENT_TEAM=$APPLE_TEAM_ID
           CODE_SIGN_STYLE=Manual
           PROVISIONING_PROFILE_SPECIFIER=$uuid
           EOF
@@ -775,13 +779,16 @@ jobs:
       - name: Package for the Store
         if: env.MSIX_PUBLISHER != ''
         working-directory: app
+        env:
+          MSIX_IDENTITY_NAME: ${{ secrets.MSIX_IDENTITY_NAME }}
+          MSIX_PUBLISHER_DISPLAY_NAME: ${{ secrets.MSIX_PUBLISHER_DISPLAY_NAME }}
         run: >
           dart run msix:create --build-windows false --store
           --version "${{ env.MSIX_VERSION }}"
           --output-name "mumbleway-store-${{ env.MSIX_VERSION }}"
-          --publisher "${{ secrets.MSIX_PUBLISHER }}"
-          --identity-name "${{ secrets.MSIX_IDENTITY_NAME }}"
-          --publisher-display-name "${{ secrets.MSIX_PUBLISHER_DISPLAY_NAME }}"
+          --publisher "$env:MSIX_PUBLISHER"
+          --identity-name "$env:MSIX_IDENTITY_NAME"
+          --publisher-display-name "$env:MSIX_PUBLISHER_DISPLAY_NAME"
 
       - name: Package for sideloading
         if: env.MSIX_PUBLISHER == ''
@@ -941,12 +948,17 @@ jobs:
           env.MSIX_PUBLISHER != '' && env.STORE_PRODUCT_ID != '' &&
           (github.event_name == 'push' || inputs.microsoft_store)
         shell: pwsh
+        env:
+          AZURE_AD_TENANT_ID: ${{ secrets.AZURE_AD_TENANT_ID }}
+          MSIX_SELLER_ID: ${{ secrets.MSIX_SELLER_ID }}
+          AZURE_AD_APPLICATION_CLIENT_ID: ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }}
+          AZURE_AD_APPLICATION_SECRET: ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
         run: |
           msstore reconfigure `
-            --tenantId "${{ secrets.AZURE_AD_TENANT_ID }}" `
-            --sellerId "${{ secrets.MSIX_SELLER_ID }}" `
-            --clientId "${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }}" `
-            --clientSecret "${{ secrets.AZURE_AD_APPLICATION_SECRET }}"
+            --tenantId "$env:AZURE_AD_TENANT_ID" `
+            --sellerId "$env:MSIX_SELLER_ID" `
+            --clientId "$env:AZURE_AD_APPLICATION_CLIENT_ID" `
+            --clientSecret "$env:AZURE_AD_APPLICATION_SECRET"
 
       # Refuse to submit over a submission that is still being certified.
       #
@@ -1096,19 +1108,19 @@ jobs:
           # is how 1.1.148.0 reached the Store with the 1.0.1 description and the
           # 1.0.1 release notes, green all the way. `docs/RELEASING.md` 4e-bis
           # worked this route out, and this is it.
-          msstore publish $package -id "${{ env.STORE_PRODUCT_ID }}" --noCommit
+          msstore publish $package -id "$env:STORE_PRODUCT_ID" --noCommit
           if ($LASTEXITCODE -ne 0) {
-            Write-Output "::error::Staging the package failed, so nothing was submitted. Check Partner Center for a draft submission left open; 'msstore submission delete ${{ env.STORE_PRODUCT_ID }} --no-confirm' clears one the API created."
+            Write-Output "::error::Staging the package failed, so nothing was submitted. Check Partner Center for a draft submission left open; 'msstore submission delete $env:STORE_PRODUCT_ID --no-confirm' clears one the API created."
             exit 1
           }
 
           # The text this repository holds, into the draft just staged, and only
           # then commit. `--expect-version` refuses to commit a draft the
           # package did not attach to, which would spend the run on text alone.
-          python ../tool/push_ms_store_listing.py "${{ env.STORE_PRODUCT_ID }}" `
+          python ../tool/push_ms_store_listing.py "$env:STORE_PRODUCT_ID" `
             --push --submit --expect-version "${{ env.MSIX_VERSION }}"
           if ($LASTEXITCODE -ne 0) {
-            Write-Output "::error::The package is staged but the listing text or the commit failed, so this submission is sitting as an uncommitted draft. Finish it with 'python tool/push_ms_store_listing.py <productId> --push --submit', or discard it with 'msstore submission delete ${{ env.STORE_PRODUCT_ID }} --no-confirm'. The MSIX is attached to this run."
+            Write-Output "::error::The package is staged but the listing text or the commit failed, so this submission is sitting as an uncommitted draft. Finish it with 'python tool/push_ms_store_listing.py <productId> --push --submit', or discard it with 'msstore submission delete $env:STORE_PRODUCT_ID --no-confirm'. The MSIX is attached to this run."
             exit 1
           }
 
@@ -1214,13 +1226,16 @@ jobs:
       - name: Package for the Store
         if: env.MSIX_PUBLISHER != ''
         working-directory: app
+        env:
+          MSIX_IDENTITY_NAME: ${{ secrets.MSIX_IDENTITY_NAME }}
+          MSIX_PUBLISHER_DISPLAY_NAME: ${{ secrets.MSIX_PUBLISHER_DISPLAY_NAME }}
         run: >
           dart run msix:create --build-windows false --store --architecture arm64
           --version "${{ env.MSIX_VERSION }}"
           --output-name "mumbleway-store-arm64-${{ env.MSIX_VERSION }}"
-          --publisher "${{ secrets.MSIX_PUBLISHER }}"
-          --identity-name "${{ secrets.MSIX_IDENTITY_NAME }}"
-          --publisher-display-name "${{ secrets.MSIX_PUBLISHER_DISPLAY_NAME }}"
+          --publisher "$env:MSIX_PUBLISHER"
+          --identity-name "$env:MSIX_IDENTITY_NAME"
+          --publisher-display-name "$env:MSIX_PUBLISHER_DISPLAY_NAME"
 
       - name: Say what is in the package
         if: env.MSIX_PUBLISHER != ''
@@ -1336,9 +1351,11 @@ jobs:
 
       - name: Install provisioning profile
         if: steps.gate.outputs.ready == 'true'
+        env:
+          MACOS_PROVISIONING_PROFILE: ${{ secrets.MACOS_PROVISIONING_PROFILE }}
         run: |
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          echo "${{ secrets.MACOS_PROVISIONING_PROFILE }}" | base64 -d \
+          echo "$MACOS_PROVISIONING_PROFILE" | base64 -d \
             > ~/Library/MobileDevice/Provisioning\ Profiles/mumbleway.provisionprofile
 
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
@@ -1350,6 +1367,8 @@ jobs:
 
       - name: Point the release build at the distribution profile
         if: steps.gate.outputs.ready == 'true'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           profile=~/Library/MobileDevice/Provisioning\ Profiles/mumbleway.provisionprofile
@@ -1377,7 +1396,7 @@ jobs:
           echo "INSTALLER_IDENTITY=$installer_id" >> $GITHUB_ENV
 
           cat >> app/macos/Flutter/Flutter-Release.xcconfig <<EOF
-          DEVELOPMENT_TEAM=${{ secrets.APPLE_TEAM_ID }}
+          DEVELOPMENT_TEAM=$APPLE_TEAM_ID
           CODE_SIGN_STYLE=Manual
           PROVISIONING_PROFILE_SPECIFIER=$uuid
           CODE_SIGN_IDENTITY=$app_id

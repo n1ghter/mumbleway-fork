@@ -120,12 +120,17 @@ jobs:
       # that is the only interface the CLI offers, and none is ever echoed.
       - name: Sign in to Partner Center
         shell: pwsh
+        env:
+          AZURE_AD_TENANT_ID: ${{ secrets.AZURE_AD_TENANT_ID }}
+          MSIX_SELLER_ID: ${{ secrets.MSIX_SELLER_ID }}
+          AZURE_AD_APPLICATION_CLIENT_ID: ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }}
+          AZURE_AD_APPLICATION_SECRET: ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
         run: |
           msstore reconfigure `
-            --tenantId "${{ secrets.AZURE_AD_TENANT_ID }}" `
-            --sellerId "${{ secrets.MSIX_SELLER_ID }}" `
-            --clientId "${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }}" `
-            --clientSecret "${{ secrets.AZURE_AD_APPLICATION_SECRET }}"
+            --tenantId "$env:AZURE_AD_TENANT_ID" `
+            --sellerId "$env:MSIX_SELLER_ID" `
+            --clientId "$env:AZURE_AD_APPLICATION_CLIENT_ID" `
+            --clientSecret "$env:AZURE_AD_APPLICATION_SECRET"
 
       # The inputs arrive as environment variables rather than being
       # interpolated into the command. `${{ }}` substitution happens before the

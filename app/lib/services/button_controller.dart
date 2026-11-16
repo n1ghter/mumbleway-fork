@@ -1,3 +1,5 @@
+import 'dart:io' show Platform;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
@@ -89,6 +91,19 @@ class ButtonController {
 
   static const _channel = MethodChannel('mumbleway/buttons');
 
+  /// Window within which a duplicate edge on the other input path (global
+  /// hotkey vs. focused [HardwareKeyboard]) is ignored so focused windows
+  /// never double-toggle.
+  static const _dedupWindow = Duration(milliseconds: 80);
+
+  /// Overrides desktop platform detection for tests running on any host OS.
+  @visibleForTesting
+  static bool? globalHotkeysSupportedOverride;
+
+  /// Overrides the wall clock for deterministic deduplication tests.
+  @visibleForTesting
+  static DateTime Function()? clockOverride;
+
   final List<ButtonBinding> _bindings = [];
   List<ButtonBinding> get bindings => List.unmodifiable(_bindings);
 
@@ -110,9 +125,42 @@ class ButtonController {
 
   bool _installed = false;
   bool _toggleState = false;
+  int _syncGeneration = 0;
+
+  int? _lastHardwareKeyId;
+  bool? _lastHardwarePressed;
+  DateTime? _lastHardwareAt;
+
+  int? _lastGlobalKeyId;
+  bool? _lastGlobalPressed;
+  DateTime? _lastGlobalAt;
 
   /// Whether a binding is currently being learned.
   bool get isLearning => _learner != null;
+
+  static DateTime _now() => (clockOverride ?? DateTime.now)();
+
+  static bool get _supportsGlobalHotkeys {
+    final override = globalHotkeysSupportedOverride;
+    if (override != null) return override;
+    if (kIsWeb) return false;
+    try {
+      return Platform.isWindows || Platform.isMacOS;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Clears recent-event deduplication state, for tests.
+  @visibleForTesting
+  void resetDeduplication() {
+    _lastHardwareKeyId = null;
+    _lastHardwarePressed = null;
+    _lastHardwareAt = null;
+    _lastGlobalKeyId = null;
+    _lastGlobalPressed = null;
+    _lastGlobalAt = null;
+  }
 
   void setBindings(List<ButtonBinding> bindings) {
     _bindings
@@ -146,6 +194,15 @@ class ButtonController {
           args['keyCode'] as int? ?? 0,
           args['pressed'] as bool? ?? false,
         );
+      } else if (call.method == 'globalHotkey') {
+        final args = call.arguments;
+        if (args is Map) {
+          final keyId = args['keyId'];
+          final pressed = args['pressed'];
+          if (keyId is int && pressed is bool) {
+            handleGlobalHotkey(keyId, pressed);
+          }
+        }
       }
       return null;
     });
@@ -154,6 +211,8 @@ class ButtonController {
   void dispose() {
     if (!_installed) return;
     HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
+    _channel.setMethodCallHandler(null);
+    resetDeduplication();
     _installed = false;
   }
 
@@ -180,6 +239,7 @@ class ButtonController {
   /// Android reports the same buttons through its media session without any of
   /// this, and has no handler for the call.
   void _syncCapture() {
+    _syncGeneration++;
     final want =
         _learner != null || _bindings.any((b) => b.keyId >= _mediaKeyBase);
     _channel
@@ -195,6 +255,30 @@ class ButtonController {
           onCaptureChanged?.call();
           return null;
         });
+
+    if (_supportsGlobalHotkeys) {
+      final seen = <int>{};
+      // Pause desktop hotkey interception while learning so a previously bound
+      // key reaches HardwareKeyboard cleanly instead of firing WM_HOTKEY.
+      final keyIds = _learner != null
+          ? const <int>[]
+          : <int>[
+              for (final b in _bindings)
+                if ((b.keyId < _mediaKeyBase ||
+                        b.keyId >= _flutterKeyPlaneStart) &&
+                    seen.add(b.keyId))
+                  b.keyId,
+            ];
+      _syncGlobalHotkeys(keyIds);
+    }
+  }
+
+  Future<void> _syncGlobalHotkeys(List<int> keyIds) async {
+    try {
+      await _channel.invokeMethod<void>('setGlobalHotkeys', {'keyIds': keyIds});
+    } catch (_) {
+      // Unsupported platforms or test environments without a platform runner.
+    }
   }
 
   /// What the platform said when last asked to listen for remote buttons.
@@ -208,6 +292,7 @@ class ButtonController {
   VoidCallback? onCaptureChanged;
 
   static const _mediaKeyBase = 0x7000_0000;
+  static const _flutterKeyPlaneStart = 0x0100000000;
 
   bool _handleKeyEvent(KeyEvent event) {
     final id = event.logicalKey.keyId;
@@ -224,9 +309,13 @@ class ButtonController {
     if (_learner != null) {
       if (event is KeyDownEvent) {
         final learner = _learner!;
+        final gen = _syncGeneration;
         _learner = null;
         _swallowRelease = id;
         learner(id, _describe(event.logicalKey));
+        if (_learner == null && _syncGeneration == gen) {
+          _syncCapture();
+        }
         // Swallow it: the key that is being bound should not also trigger
         // whatever it happens to be bound to already.
         return true;
@@ -239,11 +328,69 @@ class ButtonController {
       return true;
     }
 
-    return _dispatch(
+    if (event is KeyRepeatEvent) {
+      return _dispatch(id, false, isRepeat: true);
+    }
+
+    if (event is! KeyDownEvent && event is! KeyUpEvent) {
+      return false;
+    }
+
+    final pressed = event is KeyDownEvent;
+    final now = _now();
+    if (_isRecentDuplicate(
       id,
-      event is KeyDownEvent,
-      isRepeat: event is KeyRepeatEvent,
-    );
+      pressed,
+      _lastGlobalKeyId,
+      _lastGlobalPressed,
+      _lastGlobalAt,
+      now,
+    )) {
+      return _bindingFor(id) != null;
+    }
+
+    _lastHardwareKeyId = id;
+    _lastHardwarePressed = pressed;
+    _lastHardwareAt = now;
+
+    return _dispatch(id, pressed);
+  }
+
+  /// Handles a desktop global hotkey forwarded from the platform runner.
+  void handleGlobalHotkey(int keyId, bool pressed) {
+    if (_learner != null) return;
+
+    final now = _now();
+    if (_isRecentDuplicate(
+      keyId,
+      pressed,
+      _lastHardwareKeyId,
+      _lastHardwarePressed,
+      _lastHardwareAt,
+      now,
+    )) {
+      return;
+    }
+
+    if (_dispatch(keyId, pressed)) {
+      _lastGlobalKeyId = keyId;
+      _lastGlobalPressed = pressed;
+      _lastGlobalAt = now;
+    }
+  }
+
+  static bool _isRecentDuplicate(
+    int keyId,
+    bool pressed,
+    int? lastId,
+    bool? lastPressed,
+    DateTime? lastAt,
+    DateTime now,
+  ) {
+    if (lastId != keyId || lastPressed != pressed || lastAt == null) {
+      return false;
+    }
+    return now.difference(lastAt) <= _dedupWindow;
   }
 
   /// Handles a media button forwarded from the platform.
@@ -304,14 +451,15 @@ class ButtonController {
   /// confused for one another.
   static int mediaKeyId(int androidKeyCode) => _mediaKeyBase + androidKeyCode;
 
-  bool _dispatch(int keyId, bool pressed, {bool isRepeat = false}) {
-    ButtonBinding? binding;
+  ButtonBinding? _bindingFor(int keyId) {
     for (final b in _bindings) {
-      if (b.keyId == keyId) {
-        binding = b;
-        break;
-      }
+      if (b.keyId == keyId) return b;
     }
+    return null;
+  }
+
+  bool _dispatch(int keyId, bool pressed, {bool isRepeat = false}) {
+    final binding = _bindingFor(keyId);
     if (binding == null) return false;
 
     // Auto-repeat while a key is held would toggle continuously.

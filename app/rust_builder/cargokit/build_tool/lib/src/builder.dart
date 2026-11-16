@@ -215,6 +215,10 @@ class RustBuilder {
         '--target-dir',
         targetTempDir,
       ],
+      // MumbleWay: Cargo discovers `.cargo/config.toml` by walking upward from
+      // its working directory, not from `--manifest-path`. Without this,
+      // `run_build_tool.cmd` leaves CWD in `CARGOKIT_TOOL_TEMP_DIR` (outside
+      // the repo under `%LOCALAPPDATA%\cargokit`), skipping `.cargo/config.toml`.
       workingDirectory: environment.manifestDir,
       environment: await _buildEnvironment(),
     );

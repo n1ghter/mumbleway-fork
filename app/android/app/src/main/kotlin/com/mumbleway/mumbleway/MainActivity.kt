@@ -615,6 +615,9 @@ class MainActivity : FlutterActivity() {
             // say while the phone's own microphone is the live one. See
             // `AudioRouting.headsetPresent`.
             "headset" to audioRouting.headsetPresent(),
+            // Set once, if a reclaim or route switch happened before this
+            // reply was constructed.
+            "sessionRebuilt" to audioRouting.takeSessionRebuilt(),
             // Android does not offer a channel count before the device is open,
             // and the engine opens it itself. Negative means "not known", which
             // the Dart side distinguishes from zero — and zero, which means

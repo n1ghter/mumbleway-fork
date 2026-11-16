@@ -1474,7 +1474,7 @@ class _OverlayTileState extends State<_OverlayTile> {
           title: Text(l.floatingWindow),
           subtitle: Text(_subtitleFor(kind)),
           isThreeLine: kind == FloatingKind.iosPictureInPicture,
-          value: state.overlayEnabled,
+          value: state.wantOverlay,
           onChanged: _busy
               ? null
               : (want) async {

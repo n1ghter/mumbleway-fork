@@ -4580,19 +4580,13 @@ class AppState extends ChangeNotifier {
   bool get overlaySupported => overlay.isSupported;
   FloatingKind get overlayKind => overlay.kind;
 
-  /// Shows the floating window. Returns an error message, or null on success.
-  Future<String?> enableOverlay() async {
-    if (!overlay.isSupported) {
-      return 'Floating windows are not available on this platform.';
-    }
-    if (!await overlay.hasPermission()) {
-      // Android only grants this from its own settings screen.
-      await overlay.requestPermission();
-      if (!await overlay.hasPermission()) {
-        return 'Allow "display over other apps" for MumbleWay, then try again.';
-      }
-    }
-
+  /// Binds the floating window's control callbacks and localized phrases.
+  ///
+  /// Kept separate from [enableOverlay] so launch can wire the bridge up even
+  /// when the permission prompt is skipped — if the rider later grants "display
+  /// over other apps" in system settings and starts a call, [_syncOverlayToCalls]
+  /// shows the window without going through [enableOverlay] again.
+  Future<void> _bindOverlayCallbacks() async {
     // The window is another view onto the same state, not a second source of
     // truth: every control routes back through here and waits to be told the
     // result, so the two can never drift apart.
@@ -4611,10 +4605,26 @@ class AppState extends ChangeNotifier {
       overlayStatus = message;
       notifyListeners();
     };
+    await overlay.setPhrases(_overlayPhrases());
+  }
+
+  /// Shows the floating window. Returns an error message, or null on success.
+  Future<String?> enableOverlay() async {
+    if (!overlay.isSupported) {
+      return 'Floating windows are not available on this platform.';
+    }
+    if (!await overlay.hasPermission()) {
+      // Android only grants this from its own settings screen.
+      await overlay.requestPermission();
+      if (!await overlay.hasPermission()) {
+        return 'Allow "display over other apps" for MumbleWay, then try again.';
+      }
+    }
+
+    await _bindOverlayCallbacks();
 
     overlayStatus = null;
-    await overlay.setPhrases(_overlayPhrases());
-    unawaited(_rememberOverlayChoice(true));
+    await _rememberOverlayChoice(true);
 
     // Turning the setting on is not the same as putting a window on screen.
     // With nothing connected there is no call for it to be about, so it stays
@@ -4817,26 +4827,48 @@ class AppState extends ChangeNotifier {
   /// so asking means throwing the rider out of the app. Doing that on every
   /// launch until they gave in was the single most complained-about thing in
   /// the app: a rider who does not want the window was sent to Settings each
-  /// time they opened it. So launch asks once; after that, a missing
+  /// time they opened it. So launch asks once (and only once a server is
+  /// saved, so first-run onboarding is never hijacked); after that, a missing
   /// permission just leaves the window off, and the switch in Settings —
   /// which calls [enableOverlay] directly — is where it gets asked for again.
+  ///
+  /// Callbacks and phrases are wired up unconditionally whenever the platform
+  /// supports an overlay, so granting the permission later in system settings
+  /// still produces working window controls without needing another restart.
   Future<void> _restoreOverlay() async {
+    if (!overlay.isSupported) return;
+    await _bindOverlayCallbacks();
     final prefs = await SharedPreferences.getInstance();
-    if (!await mayAskForOverlayAtLaunch(prefs, overlay.hasPermission)) return;
+    if (!await mayAskForOverlayAtLaunch(
+      prefs,
+      overlay.hasPermission,
+      hasServers: servers.isNotEmpty,
+    )) {
+      return;
+    }
     await enableOverlay();
   }
+
+  /// Exposes [_restoreOverlay] for tests without a live audio engine.
+  @visibleForTesting
+  Future<void> restoreOverlayForTesting() => _restoreOverlay();
 
   /// Whether this launch may go on to [enableOverlay], which opens the
   /// system settings page when the permission is missing.
   ///
-  /// True when the permission is already there, since nothing is asked then.
-  /// Otherwise true only the first time, and the asking is recorded before it
-  /// happens: a launch that dies on the settings page must not ask again.
+  /// Requires [hasServers] so a brand-new rider is not thrown out into system
+  /// settings before seeing the home screen or adding any server (without
+  /// spending the one-time prompt). True when [hasServers] holds and the
+  /// permission is already there, since nothing is asked then; otherwise true
+  /// only the first time, and the asking is recorded before it happens: a
+  /// launch that dies on the settings page must not ask again.
   @visibleForTesting
   static Future<bool> mayAskForOverlayAtLaunch(
     SharedPreferences prefs,
-    Future<bool> Function() hasPermission,
-  ) async {
+    Future<bool> Function() hasPermission, {
+    bool hasServers = true,
+  }) async {
+    if (!hasServers) return false;
     if (await hasPermission()) return true;
     if (prefs.getBool(_prefsOverlayAsked) ?? false) return false;
     await prefs.setBool(_prefsOverlayAsked, true);
@@ -4882,6 +4914,9 @@ class AppState extends ChangeNotifier {
   /// which is the normal state whenever the app is in the foreground.
   bool _wantOverlay = true;
 
+  /// Whether the rider wants the floating call window when a call is live.
+  bool get wantOverlay => _wantOverlay;
+
   Future<void> _rememberOverlayChoice(bool want) async {
     _wantOverlay = want;
     final prefs = await SharedPreferences.getInstance();
@@ -4889,7 +4924,7 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> disableOverlay() async {
-    unawaited(_rememberOverlayChoice(false));
+    await _rememberOverlayChoice(false);
     overlayStatus = null;
     await overlay.hide();
     overlayEnabled = false;

@@ -2620,7 +2620,9 @@ async fn flush_pending_crypt(
         };
         if let Some(iv) = iv {
             tracing::info!("server asked for our voice nonce, sending it");
-            writer.send(MessageType::CryptSetup, &nonce_reply(iv)).await?;
+            writer
+                .send(MessageType::CryptSetup, &nonce_reply(iv))
+                .await?;
             state.last_nonce_reply = Some(Instant::now());
         }
     }
@@ -2971,7 +2973,12 @@ mod tests {
         let (ev_tx, ev_rx) = mpsc::channel(128);
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let (audio, handles) = test_bridge();
-        (Session::new(config, ev_tx, cmd_rx, audio), ev_rx, cmd_tx, handles)
+        (
+            Session::new(config, ev_tx, cmd_rx, audio),
+            ev_rx,
+            cmd_tx,
+            handles,
+        )
     }
 
     fn test_tls_acceptor() -> tokio_rustls::TlsAcceptor {
@@ -3056,7 +3063,10 @@ mod tests {
         let mut session = Session::new(test_config(1), ev_tx, cmd_rx, audio);
 
         cmd_tx.send(SessionCommand::NetworkAvailable).await.unwrap();
-        cmd_tx.send(SessionCommand::SetSelfMute(true)).await.unwrap();
+        cmd_tx
+            .send(SessionCommand::SetSelfMute(true))
+            .await
+            .unwrap();
         cmd_tx.send(SessionCommand::NetworkAvailable).await.unwrap();
         cmd_tx.send(SessionCommand::Disconnect).await.unwrap();
 
@@ -3236,10 +3246,16 @@ mod tests {
         // with startup traffic and fires well ahead of the 5 s ping interval.
         let wait = Duration::from_secs(2);
         let init_tcp = tokio::time::timeout(wait, tcp_ping_rx.recv()).await;
-        assert!(matches!(init_tcp, Ok(Some(()))), "expected initial tick-0 TCP ping");
+        assert!(
+            matches!(init_tcp, Ok(Some(()))),
+            "expected initial tick-0 TCP ping"
+        );
         for _ in 0..2 {
             let init_udp = tokio::time::timeout(wait, udp_ping_rx.recv()).await;
-            assert!(matches!(init_udp, Ok(Some(()))), "expected initial UDP pings");
+            assert!(
+                matches!(init_udp, Ok(Some(()))),
+                "expected initial UDP pings"
+            );
         }
 
         cmd_tx.send(SessionCommand::NetworkAvailable).await.unwrap();
@@ -3435,7 +3451,10 @@ mod tests {
             .expect("Shutdown must abort Connecting promptly")
             .unwrap();
         while let Ok(ev) = ev_rx.try_recv() {
-            assert!(!matches!(ev, SessionEvent::State(ConnectionState::Reconnecting { .. })));
+            assert!(!matches!(
+                ev,
+                SessionEvent::State(ConnectionState::Reconnecting { .. })
+            ));
         }
         server.abort();
     }
@@ -3554,7 +3573,10 @@ mod tests {
         accepted_rx.await.unwrap();
 
         // Buffer a non-disconnect command while connect_and_handshake is stalled.
-        cmd_tx.send(SessionCommand::SetSelfMute(true)).await.unwrap();
+        cmd_tx
+            .send(SessionCommand::SetSelfMute(true))
+            .await
+            .unwrap();
         let _ = proceed_tx.send(());
 
         let saw_mute = tokio::time::timeout(Duration::from_secs(3), muted_rx)

@@ -617,7 +617,9 @@ mod tests {
 
         // Echo the older ping (101) after ping 202 was already sent.
         let earlier_than_pong = Instant::now();
-        let echo1 = server_crypt.encrypt(&audio_packet::encode_ping(101)).unwrap();
+        let echo1 = server_crypt
+            .encrypt(&audio_packet::encode_ping(101))
+            .unwrap();
         server.send_to(&echo1, from).await.unwrap();
         match client.recv().await.unwrap() {
             UdpEvent::Pong { rtt } => {
@@ -632,7 +634,9 @@ mod tests {
         assert!(client.is_healthy(earlier_than_pong));
 
         // Unmatched timestamp falls back to last_ping_sent without panicking.
-        let echo_unknown = server_crypt.encrypt(&audio_packet::encode_ping(999)).unwrap();
+        let echo_unknown = server_crypt
+            .encrypt(&audio_packet::encode_ping(999))
+            .unwrap();
         server.send_to(&echo_unknown, from).await.unwrap();
         assert!(matches!(
             client.recv().await.unwrap(),

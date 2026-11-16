@@ -715,7 +715,9 @@ mod tests {
             if i <= 10 {
                 links.on_stats("s1", now, 120.0, i as u32 + 1, false);
             }
-            let report = links.on_totals("s1", now, 100 + 250 * (i as u32 - 2), 0).unwrap();
+            let report = links
+                .on_totals("s1", now, 100 + 250 * (i as u32 - 2), 0)
+                .unwrap();
             a.update(now, report);
         }
         assert_eq!(a.bps(), AUTO_START_BPS);
@@ -776,7 +778,9 @@ mod tests {
             if let Some(r) = links.on_stats("clean", now, 40.0, i as u32 + 1, false) {
                 a.update(now, r);
             }
-            let r = links.on_totals("clean", now, 100 + 250 * i as u32, 0).unwrap();
+            let r = links
+                .on_totals("clean", now, 100 + 250 * i as u32, 0)
+                .unwrap();
             a.update(now, r);
         }
         assert_eq!(a.bps(), AUTO_START_BPS);

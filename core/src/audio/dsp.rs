@@ -733,7 +733,11 @@ impl LevelNormalizer {
         // Only adapt on actual speech. Adapting during the gaps would wind the
         // gain up on silence and then blast the next word.
         if level > self.floor_db {
-            let error = self.target_db - level;
+            // Against what the listener gets, not what arrived. Measured on
+            // the input, the error never shrinks as the gain moves, so every
+            // speaker below the target was driven to the +18 dB ceiling and
+            // every one above it to the -18 dB floor.
+            let error = self.target_db - (level + self.gain_db);
             let step = error.clamp(-self.step_db, self.step_db);
             self.gain_db = (self.gain_db + step).clamp(self.min_gain_db, self.max_gain_db);
         }
@@ -1431,6 +1435,33 @@ mod tests {
         );
         assert!(quiet.gain_db() > 0.0, "quiet speaker should be boosted");
         assert!(loud.gain_db() < 0.0, "loud speaker should be attenuated");
+    }
+
+    /// A 20 ms block of sine whose RMS sits at `db` dBFS — the length
+    /// `SpeakerBuffer` hands the normaliser for an ordinary sender.
+    fn block_at(db: f32, freq: f32) -> Vec<f32> {
+        tone(freq, 960, 10f32.powf(db / 20.0) * std::f32::consts::SQRT_2)
+    }
+
+    #[test]
+    fn normaliser_settles_instead_of_running_to_its_limits() {
+        // A talker 6 dB under the target needs 6 dB, not the ceiling. The
+        // error used to be taken on the input, where it never shrinks as the
+        // gain moves, so the gain ran to +18 dB and the talker came out 12 dB
+        // over the target — the same ±18 dB for everyone, either way.
+        for (talker_db, wanted) in [(-26.0f32, 6.0f32), (-12.0, -8.0)] {
+            let mut n = LevelNormalizer::new(-20.0);
+            for i in 0..1_500 {
+                // Words with gaps between them, not a steady tone.
+                let db = if i % 10 < 8 { talker_db } else { -70.0 };
+                n.process(&mut block_at(db, 300.0));
+            }
+            assert!(
+                (n.gain_db() - wanted).abs() < 1.0,
+                "talker at {talker_db} dBFS: gain {:.1} dB, wanted {wanted}",
+                n.gain_db()
+            );
+        }
     }
 
     #[test]

@@ -64,6 +64,8 @@ class FlutterWindow : public Win32Window {
       power_channel_;
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
       buttons_channel_;
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
+      secrets_channel_;
   std::unordered_map<int, RegisteredHotkey> registered_hotkeys_;
   std::vector<RegisteredHotkey> held_hotkeys_;
   bool hotkey_timer_active_ = false;

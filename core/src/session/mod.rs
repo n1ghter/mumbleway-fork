@@ -512,28 +512,30 @@ impl Session {
     /// Runs `connect_and_handshake` while remaining responsive to `Disconnect`
     /// and `Shutdown`. Non-disconnect commands are buffered so nothing is dropped.
     async fn connect_or_abort(&mut self) -> Option<Result<AttemptOutcome>> {
-        let attempt = self.inner.connect_and_handshake();
-        tokio::pin!(attempt);
-        loop {
-            tokio::select! {
-                biased;
-                cmd = self.commands.recv() => match cmd {
-                    Some(SessionCommand::Disconnect) => {
-                        self.inner.reconnect.stop();
-                        self.pending_commands.clear();
-                        return Some(Ok(AttemptOutcome::Ended(DisconnectReason::UserRequested)));
-                    }
-                    Some(SessionCommand::Shutdown) | None => {
-                        self.inner.reconnect.stop();
-                        self.pending_commands.clear();
-                        return None;
-                    }
-                    Some(other) => {
-                        self.pending_commands.push_back(other);
-                    }
-                },
-                res = &mut attempt => return Some(res),
+        let user_disconnect = {
+            let attempt = self.inner.connect_and_handshake();
+            tokio::pin!(attempt);
+            loop {
+                tokio::select! {
+                    biased;
+                    cmd = self.commands.recv() => match cmd {
+                        Some(SessionCommand::Disconnect) => break true,
+                        Some(SessionCommand::Shutdown) | None => break false,
+                        Some(other) => {
+                            self.pending_commands.push_back(other);
+                        }
+                    },
+                    res = &mut attempt => return Some(res),
+                }
             }
+        };
+        // `attempt` is dropped at the end of the block, releasing `&mut self.inner`.
+        self.inner.reconnect.stop();
+        self.pending_commands.clear();
+        if user_disconnect {
+            Some(Ok(AttemptOutcome::Ended(DisconnectReason::UserRequested)))
+        } else {
+            None
         }
     }
 
@@ -832,7 +834,7 @@ impl SessionInner {
         // No address means voice goes through the tunnel: either the rider
         // asked for that, or the server's own address could not be resolved —
         // and the cipher is kept either way, because the tunnel needs it too.
-        let mut udp = match (voice_peer, state.crypt.take()) {
+        let udp = match (voice_peer, state.crypt.take()) {
             (Some(peer), Some(crypt)) => match VoiceSocket::try_bind(peer, crypt).await {
                 Ok(mut s) => {
                     let _ = s.send_ping(now_millis()).await;

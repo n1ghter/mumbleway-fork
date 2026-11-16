@@ -9,7 +9,6 @@ void main() {
   const wifi = [ConnectivityResult.wifi];
   const mobile = [ConnectivityResult.mobile];
   const ethernet = [ConnectivityResult.ethernet];
-  const vpn = [ConnectivityResult.vpn];
   const bluetooth = [ConnectivityResult.bluetooth];
   const other = [ConnectivityResult.other];
   const settle = Duration(milliseconds: 150);

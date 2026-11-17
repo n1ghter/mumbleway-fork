@@ -26,6 +26,7 @@ import '../services/overlay.dart';
 import '../services/power.dart';
 import '../services/network_watch.dart';
 import '../services/proxy.dart';
+import '../services/secret_store.dart';
 import '../services/server_proxy.dart';
 import '../services/store_links.dart';
 import '../src/rust/api/mumbleway.dart';
@@ -651,6 +652,7 @@ class AppState extends ChangeNotifier {
   static const _prefsOverlayAsked = 'mumbleway.floatingWindowAsked';
   static const _prefsDeleted = 'mumbleway.deletedServers';
   static const _prefsSuggestedName = 'mumbleway.suggestedName';
+  static const _secretServerPrefix = 'server:';
 
   /// Languages the interface is available in.
   static const supportedLocales = [Locale('en'), Locale('ru')];
@@ -660,6 +662,10 @@ class AppState extends ChangeNotifier {
 
   final List<SavedServer> servers = [];
   final Map<String, ServerRuntime> runtimes = {};
+  final Map<String, String> _storedServerSecrets = {};
+  final Set<String> _pendingSecretDeletes = {};
+  bool _secretsLoaded = false;
+  bool _probedSecrets = false;
 
   StreamSubscription<AppEvent>? _events;
   Timer? _pingTimer;
@@ -1448,7 +1454,17 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<void> _loadServers(SharedPreferences prefs) async {
+  /// Reads saved servers and migrates any legacy plaintext passwords into
+  /// [SecretStore], without registering them in the Rust engine.
+  @visibleForTesting
+  Future<void> loadServersForTesting() async {
+    await _loadServers(await SharedPreferences.getInstance(), register: false);
+  }
+
+  Future<void> _loadServers(
+    SharedPreferences prefs, {
+    bool register = true,
+  }) async {
     _deleted
       ..clear()
       ..addAll(_decodeTombstones(prefs.getString(_prefsDeleted)));
@@ -1457,19 +1473,63 @@ class AppState extends ChangeNotifier {
       ..addAll(_decodeTombstones(prefs.getString(_prefsSettingStamps)));
     _publishedSettings = _syncedSettings();
 
+    final secrets = await SecretStore.instance.readAll();
+    final secretAvailable =
+        SecretStore.instance.isAvailable && !SecretStore.instance.lastReadFailed;
+    _storedServerSecrets.clear();
+    _pendingSecretDeletes.clear();
+    _probedSecrets = true;
+    _secretsLoaded = secretAvailable;
+    if (secretAvailable) {
+      for (final e in secrets.entries) {
+        if (e.key.startsWith(_secretServerPrefix)) {
+          _storedServerSecrets[e.key.substring(_secretServerPrefix.length)] =
+              e.value;
+        }
+      }
+    }
+
     final raw = prefs.getStringList(_prefsKey) ?? const [];
-    servers
-      ..clear()
-      ..addAll(
-        raw.map(
-          (s) => SavedServer.fromJson(jsonDecode(s) as Map<String, dynamic>),
-        ),
-      );
+    final toMigrate = <String, String>{};
+    var stripLegacyPasswords = false;
+    servers.clear();
+    for (final item in raw) {
+      final json = jsonDecode(item) as Map<String, dynamic>;
+      var s = SavedServer.fromJson(json);
+      if (secretAvailable) {
+        if (json.containsKey('password')) {
+          stripLegacyPasswords = true;
+        }
+        final storedPw = _storedServerSecrets[s.localId];
+        if (storedPw != null && storedPw.isNotEmpty) {
+          s = s.copyWith(password: storedPw);
+        } else if ((s.password ?? '').isNotEmpty) {
+          toMigrate[s.localId] = s.password!;
+        }
+      }
+      servers.add(s);
+    }
 
-    await _repairEscapedNames(prefs);
+    if (secretAvailable && toMigrate.isNotEmpty) {
+      final ok = await SecretStore.instance.writeAll({
+        for (final e in toMigrate.entries) '$_secretServerPrefix${e.key}': e.value,
+      });
+      if (ok) {
+        _storedServerSecrets.addAll(toMigrate);
+      } else {
+        stripLegacyPasswords = false;
+      }
+    }
 
-    for (final s in servers.take(maxServers)) {
-      await _register(s);
+    final namesChanged = await _repairEscapedNames(prefs);
+    if ((secretAvailable && stripLegacyPasswords) || namesChanged) {
+      await _persist(publish: false);
+    }
+
+    if (register) {
+      for (final s in servers.take(maxServers)) {
+        await _register(s);
+      }
     }
   }
 
@@ -1485,8 +1545,8 @@ class AppState extends ChangeNotifier {
   /// Once, guarded by a flag, rather than on every load. A rider who genuinely
   /// wants `&amp;` in a name they typed themselves is entitled to keep it, and
   /// a repair that ran forever would take it away every time.
-  Future<void> _repairEscapedNames(SharedPreferences prefs) async {
-    if (prefs.getBool(_prefsNamesRepaired) ?? false) return;
+  Future<bool> _repairEscapedNames(SharedPreferences prefs) async {
+    if (prefs.getBool(_prefsNamesRepaired) ?? false) return false;
 
     var changed = false;
     for (var i = 0; i < servers.length; i++) {
@@ -1501,7 +1561,7 @@ class AppState extends ChangeNotifier {
     }
 
     await prefs.setBool(_prefsNamesRepaired, true);
-    if (changed) await _persist(publish: false);
+    return changed;
   }
 
   /// Saves to disk and, unless told otherwise, queues an upload.
@@ -1512,11 +1572,87 @@ class AppState extends ChangeNotifier {
   Future<void> _persist({bool publish = true}) async {
     _stampChangedSettings();
     final prefs = await SharedPreferences.getInstance();
+
+    if (!_secretsLoaded && !_probedSecrets) {
+      _probedSecrets = true;
+      final existing = await SecretStore.instance.readAll();
+      if (SecretStore.instance.isAvailable &&
+          !SecretStore.instance.lastReadFailed) {
+        _secretsLoaded = true;
+        for (final e in existing.entries) {
+          if (e.key.startsWith(_secretServerPrefix)) {
+            _storedServerSecrets[e.key.substring(_secretServerPrefix.length)] =
+                e.value;
+          }
+        }
+      }
+    }
+
+    final readFailed = !_secretsLoaded && SecretStore.instance.lastReadFailed;
+    var writeOk = SecretStore.instance.isAvailable && !readFailed;
+    var deleteOk = writeOk;
+    if (!readFailed) {
+      final toWrite = <String, String>{};
+      final toDelete = <String>{};
+      for (final s in servers) {
+        final pw = s.password;
+        if (pw != null && pw.isNotEmpty) {
+          if (!_secretsLoaded || _storedServerSecrets[s.localId] != pw) {
+            toWrite['$_secretServerPrefix${s.localId}'] = pw;
+          }
+        } else if (_storedServerSecrets.containsKey(s.localId) ||
+            _pendingSecretDeletes.contains(s.localId)) {
+          toDelete.add('$_secretServerPrefix${s.localId}');
+        }
+      }
+      for (final id in _storedServerSecrets.keys) {
+        if (!servers.any((s) => s.localId == id)) {
+          toDelete.add('$_secretServerPrefix$id');
+        }
+      }
+      for (final id in _pendingSecretDeletes) {
+        if (!servers.any(
+          (s) => s.localId == id && (s.password ?? '').isNotEmpty,
+        )) {
+          toDelete.add('$_secretServerPrefix$id');
+        }
+      }
+
+      if (toWrite.isNotEmpty) {
+        writeOk = await SecretStore.instance.writeAll(toWrite);
+      }
+      if (writeOk) {
+        for (final e in toWrite.entries) {
+          _storedServerSecrets[e.key.substring(_secretServerPrefix.length)] =
+              e.value;
+        }
+      }
+      deleteOk = writeOk;
+      if (toDelete.isNotEmpty && (writeOk || !_secretsLoaded)) {
+        deleteOk = await SecretStore.instance.deleteKeys(toDelete.toList());
+        if (deleteOk) {
+          for (final k in toDelete) {
+            final id = k.substring(_secretServerPrefix.length);
+            _storedServerSecrets.remove(id);
+            _pendingSecretDeletes.remove(id);
+          }
+        }
+      }
+      if (toDelete.isNotEmpty && !deleteOk) {
+        writeOk = false;
+      }
+    }
+    final stripPasswords = !readFailed && writeOk && deleteOk;
+
     await prefs.setString(_prefsDeleted, jsonEncode(_deleted));
     await prefs.setString(_prefsSettingStamps, jsonEncode(_settingStamps));
     await prefs.setStringList(
       _prefsKey,
-      servers.map((s) => jsonEncode(s.toJson())).toList(),
+      servers.map((s) {
+        final json = s.toJson();
+        if (stripPasswords) json.remove('password');
+        return jsonEncode(json);
+      }).toList(),
     );
     await prefs.setInt(_prefsNoise, noise.index);
     await prefs.setInt(_prefsMic, micMode.index);
@@ -1653,6 +1789,10 @@ class AppState extends ChangeNotifier {
     // it is saved.
     if (!canModifyServer(updated.id)) return _strings.serverBusyChange;
 
+    if ((servers[index].password ?? '').isNotEmpty &&
+        (updated.password ?? '').isEmpty) {
+      _pendingSecretDeletes.add(updated.localId);
+    }
     servers[index] = updated.stamped();
     await _persist();
 
@@ -2362,6 +2502,7 @@ class AppState extends ChangeNotifier {
     // Recorded before the entry goes, so the other devices are told it was
     // deleted rather than left to notice it missing and put it back.
     _deleted[id] = DateTime.now().millisecondsSinceEpoch;
+    _pendingSecretDeletes.add(id);
     servers.removeWhere((s) => s.id == id);
     _deregister(id);
     try {

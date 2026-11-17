@@ -31,7 +31,7 @@ void main() {
     final payload = <String, dynamic>{
       'keyId': keyId,
       'pressed': pressed,
-      if (modifiers != null) 'modifiers': modifiers,
+      'modifiers': ?modifiers,
     };
     final data = const StandardMethodCodec().encodeMethodCall(
       MethodCall('globalHotkey', payload),
@@ -672,7 +672,7 @@ void main() {
         const KeyUpEvent(
           physicalKey: PhysicalKeyboardKey.controlLeft,
           logicalKey: LogicalKeyboardKey.controlLeft,
-          timeStamp: const Duration(milliseconds: 95),
+          timeStamp: Duration(milliseconds: 95),
         ),
       );
     });
@@ -735,7 +735,7 @@ void main() {
         const KeyUpEvent(
           physicalKey: PhysicalKeyboardKey.controlLeft,
           logicalKey: LogicalKeyboardKey.controlLeft,
-          timeStamp: const Duration(milliseconds: 30),
+          timeStamp: Duration(milliseconds: 30),
         ),
       );
       expect(transmits, [true, false]);
@@ -782,7 +782,7 @@ void main() {
         const KeyDownEvent(
           physicalKey: PhysicalKeyboardKey.shiftLeft,
           logicalKey: LogicalKeyboardKey.shiftLeft,
-          timeStamp: const Duration(milliseconds: 20),
+          timeStamp: Duration(milliseconds: 20),
         ),
       );
       expect(transmits, [true]);

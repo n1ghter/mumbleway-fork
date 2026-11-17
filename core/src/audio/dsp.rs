@@ -695,6 +695,20 @@ impl Agc {
 /// so without this one person is inaudible under the engine while the next is
 /// painfully loud. Adapting slowly is the point: fast adaptation would pump
 /// audibly and chase the shape of individual words.
+///
+/// **It adapts only on blocks clearly above this speaker's own background.**
+/// It used to adapt on anything above a fixed -55 dBFS, which is not a test
+/// for speech at all: a rider whose wind or engine residue sits at -45 dBFS
+/// between words passed it on every block of the gate's hold tail. Called once
+/// per 20 ms packet at 0.35 dB a call, that is 17.5 dB a second, so in the
+/// second or so after each phrase the gain wound up on the background towards
+/// its +18 dB ceiling — heard as a hiss rising after every sentence, and then
+/// as the next word arriving too loud until the gain was pulled back.
+///
+/// The background is tracked with [`NoiseFloorTracker`] on the audio as it
+/// arrives, before this gain, so the estimate cannot chase its own output. A
+/// steady signal is therefore never levelled, whatever its level, because it
+/// *is* the floor; a voice is, because it rises and falls above it.
 #[derive(Debug, Clone)]
 pub struct LevelNormalizer {
     gain_db: f32,
@@ -704,9 +718,31 @@ pub struct LevelNormalizer {
     step_db: f32,
     /// Level below which a block is treated as silence and ignored.
     floor_db: f32,
+    /// This speaker's background, measured on the input.
+    noise: NoiseFloorTracker,
 }
 
 impl LevelNormalizer {
+    /// How far above the speaker's background a block has to be to count as
+    /// speech, in dB.
+    ///
+    /// Ten, because the tracker reports its minimum plus a 3 dB bias, and a
+    /// background block wanders a few dB either side of its own mean: a margin
+    /// of a few dB would let the louder half of the background through. Speech
+    /// worth levelling sits well clear of ten, and a voice that does not is
+    /// one where any gain would lift the noise as much as the words.
+    const SPEECH_MARGIN_DB: f32 = 10.0;
+
+    /// The lowest level the floor tracker is shown, in dBFS.
+    ///
+    /// The tracker falls instantly and rises at a limited rate, so one block
+    /// of near-digital silence would hold the floor down long after the
+    /// background came back, and the gain would wind up on that background
+    /// for all of the slow climb. Twenty dB under the silence threshold is
+    /// below any background that matters here and close enough to recover
+    /// from in seconds.
+    const TRACK_BOTTOM_DB: f32 = -75.0;
+
     pub fn new(target_db: f32) -> Self {
         Self {
             gain_db: 0.0,
@@ -715,6 +751,12 @@ impl LevelNormalizer {
             min_gain_db: -18.0,
             step_db: 0.35,
             floor_db: -55.0,
+            // Called per packet, so a block is 20 ms for an ordinary sender:
+            // six half-second sub-windows remember three seconds, long enough
+            // to span the breath between two sentences of one speaker. The
+            // tracker's rise limit is per block, which at this block length is
+            // 3 dB a second rather than the 6 it is documented with.
+            noise: NoiseFloorTracker::new(25),
         }
     }
 
@@ -722,22 +764,54 @@ impl LevelNormalizer {
         self.gain_db
     }
 
+    /// This speaker's background as currently estimated, in dBFS.
+    pub fn noise_floor_db(&self) -> f32 {
+        self.noise.floor_db()
+    }
+
     pub fn reset(&mut self) {
         self.gain_db = 0.0;
+        self.noise.reset();
     }
 
     /// Adapts towards the target and applies the gain in place.
     pub fn process(&mut self, buf: &mut [f32]) {
         let level = to_dbfs(rms(buf));
 
+        // The block goes into the floor before it is judged against it, so a
+        // tracker that has seen nothing yet calls the first block background
+        // rather than speech — the cautious answer when there is no evidence.
+        let floor = self.noise.update(level.max(Self::TRACK_BOTTOM_DB));
+
         // Only adapt on actual speech. Adapting during the gaps would wind the
-        // gain up on silence and then blast the next word.
-        if level > self.floor_db {
-            let error = self.target_db - level;
+        // gain up on the background and then blast the next word.
+        if level > self.floor_db && level > floor + Self::SPEECH_MARGIN_DB {
+            // Against what the listener gets, not what arrived. Measured on
+            // the input, the error never shrinks as the gain moves, so every
+            // speaker below the target was driven to the +18 dB ceiling and
+            // every one above it to the -18 dB floor.
+            let error = self.target_db - (level + self.gain_db);
             let step = error.clamp(-self.step_db, self.step_db);
             self.gain_db = (self.gain_db + step).clamp(self.min_gain_db, self.max_gain_db);
         }
 
+        self.apply(buf);
+    }
+
+    /// Applies the current gain to audio that was invented rather than
+    /// received, without learning anything from it.
+    ///
+    /// Packet-loss concealment fades towards silence over a long gap. Shown to
+    /// the floor tracker, that fade would drag this speaker's background down
+    /// instantly and let it climb back only slowly, and for all of that climb
+    /// the real background would count as speech again — the fault this
+    /// normaliser was changed to stop. Concealed audio is not what the speaker
+    /// sounds like, so it neither moves the floor nor the gain.
+    pub fn process_concealed(&mut self, buf: &mut [f32]) {
+        self.apply(buf);
+    }
+
+    fn apply(&self, buf: &mut [f32]) {
         let g = 10f32.powf(self.gain_db / 20.0);
         for s in buf.iter_mut() {
             *s = (*s * g).clamp(-1.0, 1.0);
@@ -1406,23 +1480,55 @@ mod tests {
         assert!(agc.gain_db() <= 12.0 + 1e-3, "AGC exceeded its max gain");
     }
 
+    /// A 20 ms block of sine whose RMS sits at `db` dBFS — the length
+    /// `SpeakerBuffer` hands the normaliser for an ordinary sender.
+    fn block_at(db: f32, freq: f32) -> Vec<f32> {
+        tone(freq, 960, 10f32.powf(db / 20.0) * std::f32::consts::SQRT_2)
+    }
+
+    /// Feeds one phrase and its gate-hold tail: `speech` blocks alternating
+    /// two syllable levels, then `tail` blocks of the speaker's background.
+    /// Returns the gain at the end of the phrase and at the end of the tail.
+    fn phrase_then_tail(
+        n: &mut LevelNormalizer,
+        speech_db: f32,
+        floor_db: f32,
+        speech: usize,
+        tail: usize,
+    ) -> (f32, f32) {
+        for i in 0..speech {
+            // Speech is not a steady tone: syllables rise and fall, and the
+            // gaps between words drop to the background.
+            let db = match i % 10 {
+                0..=3 => speech_db,
+                4..=7 => speech_db - 6.0,
+                _ => floor_db,
+            };
+            n.process(&mut block_at(db, 300.0));
+        }
+        let after_phrase = n.gain_db();
+        for _ in 0..tail {
+            n.process(&mut block_at(floor_db, 1_100.0));
+        }
+        (after_phrase, n.gain_db())
+    }
+
     #[test]
     fn normaliser_brings_quiet_and_loud_speakers_together() {
         // The whole point: two people arriving at very different levels should
         // end up close to each other after adaptation.
         let mut quiet = LevelNormalizer::new(-20.0);
         let mut loud = LevelNormalizer::new(-20.0);
-
-        let mut quiet_out = 0.0;
-        let mut loud_out = 0.0;
-        for _ in 0..400 {
-            let mut a = tone(300.0, 480, 0.01); // very quiet talker
-            let mut b = tone(300.0, 480, 0.6); // very loud talker
-            quiet.process(&mut a);
-            loud.process(&mut b);
-            quiet_out = to_dbfs(rms(&a));
-            loud_out = to_dbfs(rms(&b));
+        for _ in 0..12 {
+            phrase_then_tail(&mut quiet, -38.0, -70.0, 100, 50);
+            phrase_then_tail(&mut loud, -6.0, -70.0, 100, 50);
         }
+
+        let mut a = block_at(-38.0, 300.0);
+        let mut b = block_at(-6.0, 300.0);
+        quiet.process(&mut a);
+        loud.process(&mut b);
+        let (quiet_out, loud_out) = (to_dbfs(rms(&a)), to_dbfs(rms(&b)));
 
         assert!(
             (quiet_out - loud_out).abs() < 6.0,
@@ -1431,6 +1537,111 @@ mod tests {
         );
         assert!(quiet.gain_db() > 0.0, "quiet speaker should be boosted");
         assert!(loud.gain_db() < 0.0, "loud speaker should be attenuated");
+    }
+
+    #[test]
+    fn normaliser_does_not_climb_on_a_noisy_background() {
+        // The reported fault: wind or engine residue at -45 dBFS between
+        // sentences passed the old fixed -55 dBFS test on every block of the
+        // hold tail, and the gain wound up on it at 17.5 dB a second.
+        let mut n = LevelNormalizer::new(-20.0);
+        for round in 0..10 {
+            let (after_phrase, after_tail) = phrase_then_tail(&mut n, -24.0, -45.0, 100, 50);
+            if round > 0 {
+                assert!(
+                    after_tail <= after_phrase + 0.01,
+                    "round {round}: gain rose {:.2} dB on the background",
+                    after_tail - after_phrase
+                );
+            }
+        }
+        // And it still levels the speech it does hear: -24 is quieter than
+        // the -20 target, so the gain has to have come up — but only by
+        // about the difference, not to the ceiling.
+        assert!(
+            n.gain_db() > 0.5 && n.gain_db() < 10.0,
+            "gain {:.1} dB",
+            n.gain_db()
+        );
+        assert!(
+            (n.noise_floor_db() - -45.0).abs() < 5.0,
+            "floor read {:.1} dBFS for a -45 dBFS background",
+            n.noise_floor_db()
+        );
+    }
+
+    #[test]
+    fn normaliser_ignores_a_steady_drone() {
+        // A steady signal is its own floor. Levelling it would be levelling
+        // the engine, at any level the engine happens to be.
+        let mut n = LevelNormalizer::new(-20.0);
+        for _ in 0..1_000 {
+            n.process(&mut block_at(-40.0, 55.0));
+        }
+        assert_eq!(n.gain_db(), 0.0);
+    }
+
+    #[test]
+    fn concealment_does_not_drag_the_floor_down() {
+        // Packet-loss concealment fades to near silence. Had it reached the
+        // tracker, the floor would fall at once and climb back at 3 dB a
+        // second, and the -45 dBFS background would count as speech again for
+        // all of that climb.
+        let mut n = LevelNormalizer::new(-20.0);
+        for _ in 0..5 {
+            phrase_then_tail(&mut n, -24.0, -45.0, 100, 50);
+        }
+        let floor = n.noise_floor_db();
+        for _ in 0..20 {
+            n.process_concealed(&mut vec![0.0f32; 960]);
+        }
+        assert_eq!(n.noise_floor_db(), floor, "concealment moved the floor");
+
+        let before = n.gain_db();
+        for _ in 0..50 {
+            n.process(&mut block_at(-45.0, 1_100.0));
+        }
+        assert!(
+            n.gain_db() <= before + 0.01,
+            "gain climbed after concealment"
+        );
+    }
+
+    #[test]
+    fn concealed_audio_still_gets_the_gain() {
+        // Skipping the gain on invented frames would make every concealed
+        // frame a level step against the real frames either side of it.
+        let mut n = LevelNormalizer::new(-20.0);
+        for _ in 0..10 {
+            phrase_then_tail(&mut n, -38.0, -70.0, 100, 50);
+        }
+        let gain = n.gain_db();
+        assert!(gain > 3.0, "precondition: gain {gain:.1} dB");
+        let mut b = block_at(-38.0, 300.0);
+        n.process_concealed(&mut b);
+        assert!((to_dbfs(rms(&b)) - (-38.0 + gain)).abs() < 0.1);
+        assert_eq!(n.gain_db(), gain, "concealment moved the gain");
+    }
+
+    #[test]
+    fn normaliser_settles_instead_of_running_to_its_limits() {
+        // A talker 6 dB under the target needs 6 dB, not the ceiling. The
+        // error used to be taken on the input, where it never shrinks as the
+        // gain moves, so the gain ran to +18 dB and the talker came out 12 dB
+        // over the target — the same ±18 dB for everyone, either way.
+        for (talker_db, wanted) in [(-26.0f32, 6.0f32), (-12.0, -8.0)] {
+            let mut n = LevelNormalizer::new(-20.0);
+            for i in 0..1_500 {
+                // Words with gaps between them, not a steady tone.
+                let db = if i % 10 < 8 { talker_db } else { -70.0 };
+                n.process(&mut block_at(db, 300.0));
+            }
+            assert!(
+                (n.gain_db() - wanted).abs() < 1.0,
+                "talker at {talker_db} dBFS: gain {:.1} dB, wanted {wanted}",
+                n.gain_db()
+            );
+        }
     }
 
     #[test]

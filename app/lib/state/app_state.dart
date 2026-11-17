@@ -4602,8 +4602,14 @@ class AppState extends ChangeNotifier {
 
   /// Waits for the next button press and binds it to [action].
   void learnButton(ButtonAction action, void Function(ButtonBinding) onBound) {
-    buttons.learnNext((keyId, label) async {
-      final binding = ButtonBinding(keyId: keyId, action: action, label: label);
+    buttons.learnNextWithModifiers((keyId, label, modifiers) async {
+      final binding = ButtonBinding(
+        keyId: keyId,
+        action: action,
+        label: label,
+        modifiers: modifiers,
+        global: false,
+      );
       buttons.addBinding(binding);
       await _persistBindings();
       notifyListeners();
@@ -4617,8 +4623,18 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> removeButtonBinding(int keyId) async {
-    buttons.removeBinding(keyId);
+  Future<void> removeButtonBinding(int keyId, {int modifiers = 0}) async {
+    buttons.removeBinding(keyId, modifiers: modifiers);
+    await _persistBindings();
+    notifyListeners();
+  }
+
+  Future<void> setButtonBindingGlobal(
+    int keyId,
+    int modifiers,
+    bool global,
+  ) async {
+    if (!buttons.setBindingGlobal(keyId, modifiers, global)) return;
     await _persistBindings();
     notifyListeners();
   }

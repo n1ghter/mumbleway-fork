@@ -2871,9 +2871,9 @@ mod tests {
         apply_crypt_setup(&mut state, msg, Instant::now()).unwrap();
         let crypt = state.crypt.as_ref().expect("state.crypt populated");
         let pending = state.pending_crypt.as_ref().expect("pending_crypt queued");
-        assert_eq!(crypt.encrypt_iv(), cn);
+        assert_eq!(crypt.encrypt_iv(), &cn);
         assert_eq!(crypt.decrypt_iv(), &sn);
-        assert_eq!(pending.encrypt_iv(), cn);
+        assert_eq!(pending.encrypt_iv(), &cn);
         assert_eq!(pending.decrypt_iv(), &sn);
     }
 

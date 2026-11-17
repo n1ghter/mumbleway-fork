@@ -629,7 +629,6 @@ bool FlutterWindow::OnCreate() {
         }
       });
 
-<<<<<<< HEAD
   buttons_channel_ =
       std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
           flutter_controller_->engine()->messenger(), "mumbleway/buttons",

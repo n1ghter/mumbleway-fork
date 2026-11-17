@@ -8,39 +8,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Desktop global hotkeys (`#12`):** Native push-to-talk, mute, and deafen global hotkeys on Windows (`RegisterHotKey` / key polling in `flutter_window.{h,cpp}`) and macOS (`MainFlutterWindow.swift`) over the `mumbleway/buttons` channel, with cross-path edge deduplication against focused `HardwareKeyboard` events in `ButtonController`.
+- **Desktop global hotkeys (`#12`):** Opt-in per-binding (`global: false` by default) push-to-talk, mute, and deafen global hotkeys on Windows (`RegisterHotKey` + modifier-aware release polling in `flutter_window.{h,cpp}`) and macOS (Carbon `RegisterEventHotKey` / `kEventHotKeyPressed` & `kEventHotKeyReleased` without Accessibility permissions in `MainFlutterWindow.swift`), enforcing modifier or F-key/non-typing validation and cross-path edge deduplication in `ButtonController`.
 - **Adaptive bitrate UI:** Auto voice bitrate toggle and manual bitrate slider in Settings (`setVoiceBitrate` / `setVoiceBitrateSetting`).
 - **New-server username hint:** Show the automatically generated username explanation only when adding a new server (`add_server_screen.dart`), not when editing existing entries.
-- **Supply-chain & toolchain enforcement:** Added `rust-toolchain.toml` (Rust `1.97.1`), `deny.toml` (`cargo-deny` licences/bans/sources/advisories checks), and Dependabot configuration (`.github/dependabot.yml`).
+- **Supply-chain & toolchain enforcement:** Added `rust-toolchain.toml`, `deny.toml` (`cargo-deny` licences/bans/sources/advisories checks), and Dependabot configuration (`.github/dependabot.yml`).
 
 ### Changed
 - **Build & CI determinism:**
   - Updated `cargokit` (`builder.dart`) to resolve the toolchain from `rust-toolchain.toml` (`findRustToolchainChannel`, `_resolveToolchain`, covered by `toolchain_test.dart`) and invoke Cargo from `environment.manifestDir` so `.cargo/config.toml` is discovered cleanly.
-  - Hardened `.github/workflows/team-build.yml` with read-only top-level `contents: read` permissions, 40-character SHA-pinned GitHub Actions, exact `rust-toolchain.toml` installation, gating `test` (matching `build.yml` plus `cargokit/build_tool` Dart analysis/tests) and `deny` (`cargo-deny`) jobs, short-path Windows builds directly in `$GITHUB_WORKSPACE`, and persistent Android debug keystore caching.
-  - Gated GitHub release creation in `.github/workflows/publish.yml` on store upload step outcomes (`steps.upload.outcome == 'success'`) and cleaned up temporary App Store Connect API key files.
-- **Documentation & compliance (`#9`, `#26`, `#27`, `#28`):** Aligned latency, Opus FEC/DTX, privacy, and third-party licence documentation (`docs/licences.md`, `docs/ru/licences.md`, including `sonora` and `connectivity_plus`) with the current codebase and removed stale compliance/patch-reject files (`HANDOVER.md`, `INTERNAL COMPLIANCE RECORD.docx`, `.rej` files).
+  - Hardened `.github/workflows/team-build.yml` with read-only top-level `contents: read` permissions, 40-character SHA-pinned GitHub Actions, exact `rust-toolchain.toml` installation, gating `test` (including `cargokit/build_tool` `dart test -c source`) and `deny` (`cargo-deny`) jobs, short-path Windows builds, and persistent Android debug keystore caching.
+  - Updated `.github/workflows/publish.yml` to preserve build artifacts on failed store uploads (`if: always() && steps.gate.outputs.ready == 'true'`), exclude unsubmitted assets from public releases, record per-store submission status in `NOTES.md`, stage partial releases as Draft, and clean up temporary App Store Connect API keys (`umask 077`).
+  - Updated `tool/push_play_listing.mjs` to count both `completed` and `inProgress` Google Play releases as live.
+- **Documentation & compliance (`#9`, `#26`, `#27`, `#28`):** Aligned latency, Opus FEC/DTX, privacy, and third-party licence documentation (`docs/licences.md`, `docs/ru/licences.md`, `core/Cargo.toml` removing unused `aes-gcm`, `app/rust/Cargo.toml` adding `GPL-3.0-or-later`, adding `sonora`/WebRTC notices) and removed leftover `third_party/tract-core/*.rej` files while preserving owner compliance/handover files and optional TFLite staging (`#47` staged separately as Draft).
 
 ### Fixed
-- **Jitter buffer & audio engine (`#7`, `#8`):**
-  - Added `SpeakerBuffer::pop_samples` so catch-up playback at `speed > 1.0` mixes full frames without 50 Hz dropouts.
-  - Tracked `terminator_seq`, `drained_after_terminator`, and `ended_seq` in `SpeakerBuffer` so finished state resets reliably across consecutive monotonic utterances.
-  - Added `Paydown::shift_with_speech` to pause delay repayment and hold look-ahead cushion during silence, removed real-time allocations from dehiss FFT processing and `render_segments`, released idle preview DSP state (`PreviewChain`) after `PREVIEW_IDLE_TIMEOUT` (5 s), and synced `third_party/cpal/PATCH.md`.
-  - Fed `AutoBitrate` and `MultiLinkTracker` fresh UDP RTT/loss samples (updating `udp_pings` on `UdpEvent::Pong`), prevented upward bitrate drift during silence or packet loss, and restored worst-link bitrate selection across multi-server connections.
-  - Pruned closed outgoing FFI audio senders (`prune_outgoing`, `fanout_outgoing`) and skipped diagnostics polling when no session is open.
+- **Jitter buffer & audio engine (`#7`, `#8`, `#40`):**
+  - Added `SpeakerBuffer::pop_samples` so catch-up playback at `speed > 1.0` mixes full frames without 50 Hz dropouts, and tracked `terminator_seq`, `drained_after_terminator`, and `ended_seq` across consecutive monotonic utterances.
+  - Updated `LevelNormalizer` to converge on perceived output level (`input + gain`) and track per-speaker noise floors cleanly.
+  - Separated speech-gated `Paydown::shift_with_speech` (`fix/paydown-speech-gated-refill`), pre-allocated FFT scratch buffers in `SpectralSubtractor`, released idle `"mw-preview"` enhancer chains after `PREVIEW_IDLE_TIMEOUT` (5 s), fixed `render_segments` sample counts, and synced `third_party/cpal/PATCH.md` (`minSdk >= 28`).
+  - Fed `AutoBitrate` and `MultiLinkTracker` fresh UDP RTT/loss samples (`udp_pings` on `UdpEvent::Pong`), prevented upward drift on silence/loss, and restored worst-link bitrate aggregation.
+  - Pruned closed outgoing FFI audio senders (`prune_outgoing`, `fanout_outgoing`).
 - **Session & UDP recovery:**
-  - Discarded stale queued outgoing speech after server/self unsilencing (`was_silenced`) or TCP tunnel send stalls.
-  - Detected silently stale unverified UDP sockets (`is_stale_unverified`, `bound_at`, `pending_pings`), restored mid-session crypt resync throttling (`NONCE_REPLY_COOLDOWN`, `apply_crypt_setup`, `flush_pending_crypt`), and wrapped spawned reader tasks in `AbortOnDrop`.
-  - Coalesced `NetworkAvailable` events (`pending_commands`, `drain_stale_network_available`), woke idle sleeps to probe TCP (`send_ping`) immediately, and expedited `udp_retry.hurry(...)` when already connected.
+  - Discarded stale queued outgoing speech after unsilencing (`was_silenced`) or TCP tunnel send stalls.
+  - Detected silently stale unverified UDP sockets (`is_stale_unverified`, `bound_at`), throttled mid-session crypt resyncs (`NONCE_REPLY_COOLDOWN`, `apply_crypt_setup`, `flush_pending_crypt`), and aborted leaked reader tasks via `AbortOnDrop`.
+  - Coalesced `NetworkAvailable` reconnect storms (`pending_commands`, `drain_stale_network_available`), probed immediately when connected, and filtered non-routing links in `NetworkWatch`.
+  - Extracted non-conflicting session abort (`connect_or_abort`), deferred initial roster emits until `ServerSync`, and expired stale talker indicators (`TALKING_TIMEOUT`).
 - **Platform & UI polish:**
-  - Added wired and USB headset routing on Android, capped pre-API 31 Bluetooth SCO retries, fixed Binder thread races, and propagated `sessionRebuilt` into `AppState.onResumed`.
-  - Scoped Android `MediaSession` activation to active media-button bindings (`captureMediaButtons`), enabled the macOS floating overlay (`FloatingKind.floatingWindow`, `setPhrases`/`avatars`), and added Windows single-instance window activation (`main.cpp`).
-  - Bound the Settings overlay toggle to `wantOverlay`, always attached overlay callbacks (`_bindOverlayCallbacks`), and suppressed the overlay permission prompt before a first server is configured.
-  - Preserved Unicode characters in exported QR filenames (`server_qr_screen.dart`) and cleaned up temporary share files.
-- **Windows `cargokit` path & CMake fixes:** Redirected `CARGOKIT_TARGET_TEMP_DIR` under `%LOCALAPPDATA%\cargokit\<hash>` and propagated `CMAKE_POLICY_VERSION_MINIMUM=3.5` in `cargokit.cmake` to prevent `MAX_PATH` (`C1083`) and CMake 4+ failures in `audiopus_sys`/`libopus`.
-
-### Removed
-- **Unused TFLite/YAMNet stack (`#25`):** Removed `tflite_flutter` (`app/third_party/tflite_flutter`), `app/assets/models/yamnet.tflite`, `app/blobs/libtensorflowlite_c-win.dll`, `app/test/macos_tflite_dylib_test.dart`, and associated Gradle/analyzer exclusions.
+  - Restored Android `GET_DEVICES_OUTPUTS` (`A2DP | SCO | BLE`) detection in `AudioRouting.bluetoothHeadsetPresent()` for slow-HFP headsets alongside wired/USB/BLE routing, bounded pre-API 31 SCO retries, and Binder thread `mainHandler.post` safety (`#19`).
+  - Scoped Android `MediaSession` lifecycle to active calls (`OverlayService.kt`), propagated `sessionRebuilt` on iOS interruption resumes (`AudioSession.swift`), preserved Unicode QR export filenames without deleting temp files prematurely on `ShareResultStatus.unavailable` (`#22`), and bound Settings overlay controls to `wantOverlay` with `Future.sync` fingerprint safety (`#38`).
+- **Windows `cargokit` path & CMake fixes:** Redirected `CARGOKIT_TARGET_TEMP_DIR` under `%LOCALAPPDATA%\cargokit\<hash>` and propagated `CMAKE_POLICY_VERSION_MINIMUM=3.5` in `cargokit.cmake` (`#31`).
 
 ### Security
-- **Native credential storage (`#23`):** Added `SecretStore` over `mumbleway/secrets` to keep server and proxy passwords out of plaintext `SharedPreferences` and cloud/device backups using Android Keystore (`AES/GCM/NoPadding` + `noBackupFilesDir/secrets.enc`), Apple local Keychain (`kSecAttrSynchronizable = false` in `CloudStore.swift`), and Windows DPAPI (`CryptProtectData`), with automatic migration of legacy plaintext entries and backup exclusions in `backup_rules.xml` / `data_extraction_rules.xml`.
-- **Protocol, crypto & session hardening:** Hardened OCB2 replay tracking (`CryptState::encrypt_iv` by value), bounded varint recursion, gated voice/plugin packet processing on completed handshakes (`self.self_session.is_some()`), added `SessionInner` / `connect_or_abort` handshake bounds, expired stale talker indicators (`expire_stale_talkers`, `last_voice_at`), hardened proxy URL parsing, keyed remote-unmute trust on certificate hashes (`Peers::cert_hashes`, `Peers::peer_key`, `remote_mute_sender_key`) instead of display names, and cleared Pocket Mode remote-unmute grants on local unmute.
+- **Native credential storage (`#23`):** Stored server and proxy passwords in `SecretStore` over `mumbleway/secrets` (Android Keystore AES-GCM in `noBackupFilesDir/secrets.enc`, Apple local Keychain with `kSecAttrSynchronizable = false`, and Windows DPAPI in `%LOCALAPPDATA%\MumbleWay\secrets.bin`), failing safely on unreadable/undecryptable stores without overwriting data or stripping fallback preferences, and preserving existing Android Auto Backup and `device-transfer` XML rules for server lists and client identities.
+- **Protocol, crypto & session hardening:** Cleared OCB2 decrypt replay history on `set_decrypt_iv()`, rejected 0-byte ciphertexts without adding unsafe IV rollbacks on UDP send errors, anchored `ResyncGuard` consecutive failure tracking on first failure, iteratively rejected nested negative varints, matched UDP pongs in a bounded `MAX_PENDING_PINGS` window, preserved delimiters in proxy URL credentials, and authenticated remote-unmute grants via certificate hashes (`Peers::cert_hashes`, `Peers::peer_key`) instead of display names.

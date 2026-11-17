@@ -27,6 +27,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use super::adaptive::{AutoBitrate, BitrateMode, LinkReport};
 use super::clipguard::ClipGuard;
 use super::codec::{Quality, VoiceEncoder, FRAME_SAMPLES, SEQ_UNITS_PER_FRAME};
 use super::deepfilter::Enhancer;
@@ -764,6 +765,9 @@ pub struct AudioShared {
     /// encoder — so `High` and `Low` lasted exactly one block and every rider
     /// sent 24 kbit/s whatever they had chosen.
     preferred_bitrate_bps: AtomicU32,
+    /// Whether [`Self::preferred_bitrate_bps`] is the rider's fixed number or
+    /// follows the link, and the state of the latter. See [`super::adaptive`].
+    bitrate_mode: Mutex<(BitrateMode, AutoBitrate)>,
     /// What the encoder is actually set to, published for the interface: a
     /// rider whose quality has been reduced by a server should be able to see
     /// that rather than wonder.
@@ -1488,8 +1492,9 @@ impl AudioShared {
             inbound_loss_pct: AtomicU32::new(0),
             loss_mark: Mutex::new((0, 0)),
             bandwidth_cap_bps: AtomicU32::new(0),
-            preferred_bitrate_bps: AtomicU32::new(super::bandwidth::preferred_bps()),
-            encoder_bitrate_bps: AtomicU32::new(super::bandwidth::preferred_bps()),
+            preferred_bitrate_bps: AtomicU32::new(super::adaptive::AUTO_START_BPS),
+            bitrate_mode: Mutex::new((BitrateMode::Auto, AutoBitrate::default())),
+            encoder_bitrate_bps: AtomicU32::new(super::adaptive::AUTO_START_BPS),
             underrun_samples: AtomicU64::new(0),
             capture_dropped_samples: AtomicU64::new(0),
             active_speakers: AtomicU32::new(0),
@@ -1671,7 +1676,46 @@ impl AudioShared {
 
     /// Sets what to send when no server caps it, from the rider's quality.
     pub fn set_quality(&self, quality: Quality) {
-        let bps = quality.bitrate() as u32;
+        self.set_bitrate_mode(BitrateMode::Fixed(quality.bitrate() as u32));
+    }
+
+    /// Fixes the bitrate, or hands it to the link. A server's cap still
+    /// applies on top of either — see [`Self::bitrate_budget`].
+    pub fn set_bitrate_mode(&self, mode: BitrateMode) {
+        let bps = {
+            let mut m = self.bitrate_mode.lock();
+            m.0 = mode;
+            match mode {
+                BitrateMode::Fixed(bps) => bps,
+                BitrateMode::Auto => m.1.bps(),
+            }
+        };
+        self.set_preferred_bitrate(bps);
+    }
+
+    /// The mode last set by [`Self::set_bitrate_mode`].
+    pub fn bitrate_mode(&self) -> BitrateMode {
+        self.bitrate_mode.lock().0
+    }
+
+    /// Hands "Auto" the latest account of our outgoing link.
+    ///
+    /// Called by the session layer whenever a server reports on our own
+    /// connection; ignored while the rate is fixed, so a rider who chose a
+    /// number gets that number. Returns the rate now preferred.
+    pub fn report_link(&self, link: LinkReport) -> u32 {
+        let bps = {
+            let mut m = self.bitrate_mode.lock();
+            match m.0 {
+                BitrateMode::Fixed(bps) => return bps,
+                BitrateMode::Auto => m.1.update(Instant::now(), link),
+            }
+        };
+        self.set_preferred_bitrate(bps);
+        bps
+    }
+
+    fn set_preferred_bitrate(&self, bps: u32) {
         self.preferred_bitrate_bps.store(bps, Ordering::Relaxed);
         // Until the worker applies a cap, this is also what the encoder runs
         // at, and the interface should not report the default meanwhile.
@@ -4678,6 +4722,56 @@ mod tests {
             assert!(!b.capped);
             assert_eq!(shared.encoder_bitrate_bps(), q.bitrate() as u32);
         }
+    }
+
+    #[test]
+    fn auto_follows_the_link_and_fixed_ignores_it() {
+        let lossy = LinkReport {
+            loss_up: Some(0.2),
+            ..Default::default()
+        };
+        let shared = AudioShared::new();
+        shared.set_bitrate_mode(BitrateMode::Auto);
+        assert_eq!(
+            shared.bitrate_budget().bitrate_bps,
+            super::super::adaptive::AUTO_START_BPS
+        );
+        let after = shared.report_link(lossy);
+        assert!(after < super::super::adaptive::AUTO_START_BPS);
+        assert_eq!(shared.bitrate_budget().bitrate_bps, after);
+        assert_eq!(shared.encoder_bitrate_bps(), after);
+
+        shared.set_bitrate_mode(BitrateMode::Fixed(48_000));
+        assert_eq!(shared.report_link(lossy), 48_000);
+        assert_eq!(shared.bitrate_budget().bitrate_bps, 48_000);
+        // Back to Auto resumes where the link left it, not from the start.
+        shared.set_bitrate_mode(BitrateMode::Auto);
+        assert_eq!(shared.bitrate_budget().bitrate_bps, after);
+    }
+
+    #[test]
+    fn shared_starts_in_auto_at_auto_start_bps() {
+        let shared = AudioShared::new();
+        assert_eq!(shared.bitrate_mode(), BitrateMode::Auto);
+        assert_eq!(
+            shared.bitrate_budget().bitrate_bps,
+            super::super::adaptive::AUTO_START_BPS
+        );
+        assert_eq!(
+            shared.encoder_bitrate_bps(),
+            super::super::adaptive::AUTO_START_BPS
+        );
+    }
+
+    #[test]
+    fn a_server_cap_still_wins_over_auto() {
+        let shared = AudioShared::new();
+        shared.set_bitrate_mode(BitrateMode::Fixed(64_000));
+        shared.set_bandwidth_cap(72_000);
+        // (72 000 − 12 800) × 0.9 = 53 280.
+        let b = shared.bitrate_budget();
+        assert!(b.capped);
+        assert_eq!(b.bitrate_bps, 53_280);
     }
 
     #[test]

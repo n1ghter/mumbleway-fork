@@ -247,12 +247,15 @@ without the list the first thing it would accept is whatever a stranger sent.
 Client server and proxy passwords are stored locally through `SecretStore` over
 the `mumbleway/secrets` channel (#23), rather than plaintext
 `SharedPreferences` or unencrypted backups: Android wraps
-`noBackupFilesDir/secrets.enc` with Android Keystore (`AES/GCM/NoPadding`) and
-excludes `SharedPreferences` in `backup_rules.xml` / `data_extraction_rules.xml`,
+`noBackupFilesDir/secrets.enc` with Android Keystore (`AES/GCM/NoPadding`), which
+Android never backs up — so the prefs, now password-free, stay in Android Backup,
 Apple stores entries in the local Keychain (`kSecAttrSynchronizable = false` in
 `app/shared/CloudStore.swift`), and Windows encrypts `%LOCALAPPDATA%\MumbleWay\secrets.bin`
 with DPAPI (`CryptProtectData` in `flutter_window.cpp`). On load, legacy plaintext
-entries are migrated and stripped only once `SecretStore.isAvailable` succeeds.
+entries are migrated and stripped only once `SecretStore` reads cleanly without
+error (`isAvailable && !lastReadFailed`). **A store that exists and will not decrypt
+is an error, never an empty map**: the native writers merge into what they read,
+so "empty" would overwrite every stored password on the next save.
 
 ## Never edit source through a shell pipeline
 

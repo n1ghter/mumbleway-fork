@@ -244,6 +244,16 @@ The Telegram intake bot reads its token only from `MUMBLEWAY_TG_TOKEN`, and
 `MUMBLEWAY_TG_CHATS` is a mandatory allow-list — a bot username is guessable, so
 without the list the first thing it would accept is whatever a stranger sent.
 
+Client server and proxy passwords are stored locally through `SecretStore` over
+the `mumbleway/secrets` channel (#23), rather than plaintext
+`SharedPreferences` or unencrypted backups: Android wraps
+`noBackupFilesDir/secrets.enc` with Android Keystore (`AES/GCM/NoPadding`) and
+excludes `SharedPreferences` in `backup_rules.xml` / `data_extraction_rules.xml`,
+Apple stores entries in the local Keychain (`kSecAttrSynchronizable = false` in
+`app/shared/CloudStore.swift`), and Windows encrypts `%LOCALAPPDATA%\MumbleWay\secrets.bin`
+with DPAPI (`CryptProtectData` in `flutter_window.cpp`). On load, legacy plaintext
+entries are migrated and stripped only once `SecretStore.isAvailable` succeeds.
+
 ## Never edit source through a shell pipeline
 
 On Windows, `Get-Content | Set-Content -Encoding utf8` **corrupts UTF-8**: the
@@ -294,11 +304,12 @@ build on this platform.
 ```bash
 cd core     && cargo fmt --check   # CI runs this first, and it gates every job
 cd core     && cargo clippy --all-targets -- -D warnings   # same job, right after
-cd core     && cargo test          # 571 tests
+cd core     && cargo test          # unit + core/tests/ integration suite
 cd app/rust && cargo clippy --all-targets -- -D warnings   # a SECOND crate
-cd app/rust && cargo test          # 13 tests
+cd app/rust && cargo test          # FFI crate tests
+cd app/rust_builder/cargokit/build_tool && dart analyze && dart test
 cd app      && flutter analyze     # must be clean
-cd app      && flutter test        # 502 tests
+cd app      && flutter test        # Flutter widget & unit tests
 ```
 
 **`app/rust` is a separate crate and a green `core` says nothing about it.**
@@ -332,6 +343,40 @@ default PATH:
 ```
 $env:PATH = "$env:USERPROFILE\.cargo\bin;C:\src\flutter\bin;$env:PATH"
 ```
+
+### The Rust version is `rust-toolchain.toml`, and nothing else
+
+**`stable` floated, and that turned CI red on a tree nobody had touched** —
+1.100.0 arrived with a stricter `needless_range_loop` (b53a49a), while this
+machine sat on 1.97.1 and saw nothing. The release is now named in
+`rust-toolchain.toml`, so `cargo` inside the repository and every CI job run
+the same one, and a new release arrives only as a commit — usually a
+Dependabot pull request, with its own CI run to show what the new lints say.
+
+Workflows install it with `rustup toolchain install` and then make it the
+*default*, not just the directory override: cargokit's iOS build runs from
+DerivedData, outside the tree, where the file is never seen, and `rustup
+target add` has to land on the toolchain that build will use. The `Tests` job
+refuses an action referenced by tag rather than commit, and a floating
+toolchain, so neither comes back by accident.
+
+Dependabot (`.github/dependabot.yml`) is monthly, grouped and lock-file-only;
+the file says what it ignores and why. `cargo deny` checks licences and
+sources against `deny.toml` and fails on them; advisories it reports without
+failing, because they arrive on a date rather than with a commit.
+
+- **`cargokit` honors `rust-toolchain.toml` and `.cargo/config.toml`.**
+  `app/rust_builder/cargokit/build_tool/lib/src/builder.dart` resolves the
+  channel via `_resolveToolchain` / `findRustToolchainChannel` (covered by
+  `toolchain_test.dart`) and sets `workingDirectory: environment.manifestDir` so
+  Cargo discovers `.cargo/config.toml` even when invoked from `CARGOKIT_TOOL_TEMP_DIR`.
+  On Windows, `cargokit.cmake` also moves `CARGOKIT_TARGET_TEMP_DIR` under
+  `%LOCALAPPDATA%/cargokit/<hash>` and passes `CMAKE_POLICY_VERSION_MINIMUM=3.5`
+  so nested `audiopus_sys` CMake probes stay under `MAX_PATH`.
+- **`.github/workflows/team-build.yml` is gated by `test` and `deny`.** Every
+  platform job (`android`, `windows`, `macos`) uses SHA-pinned actions and
+  `rust-toolchain.toml`, and depends on the full `test` job (including
+  `cargokit/build_tool` `dart test`) plus `cargo-deny` (`deny.toml`).
 
 ### A failed Rust build does not fail `flutter build apk`
 
@@ -711,6 +756,27 @@ one, which is the same reason the app records its own capture input.
 - **`CFBundleLocalizations` must list every `.arb` language.** iOS and macOS
   report an English locale for an undeclared language whatever the phone is set
   to, so a complete translation is simply never asked for. A test asserts this.
+- **Catch-up mixing uses `SpeakerBuffer::pop_samples` and tracks `terminator_seq`.**
+  Mixing via `pop` alone while catching up at `speed > 1.0` returns variable
+  packet sizes (for example 10 ms vs 20 ms) and leaves zeros in the rest of the
+  mixer frame, causing 50 Hz dropouts; `pop_samples` refills decoded PCM into a
+  full frame (#7). Separately, `terminator_seq`, `drained_after_terminator`,
+  and `ended_seq` prevent late packets from inside an ended burst from looking
+  like a restart while still allowing monotonic higher-sequence utterances to
+  clear `finished` (#8).
+- **`Paydown` refills during silence and `PreviewChain` drops when idle.**
+  `Paydown::shift_with_speech` pauses debt repayment during `!speaking` and
+  holds frames until `fill_target()` is restored so the next word starts with
+  its look-ahead cushion intact, while `preview_worker` releases idle
+  `PreviewChain` DSP state after `PREVIEW_IDLE_TIMEOUT` (5 s).
+- **Platform button plumbing on `mumbleway/buttons` is split by OS role.** On
+  desktop (`Windows` `RegisterHotKey` + `GetAsyncKeyState` key-up polling in
+  `flutter_window.cpp`, `macOS` `NSEvent.addGlobalMonitorForEvents` when
+  inactive in `MainFlutterWindow.swift`), `setGlobalHotkeys` registers bindings
+  for unfocused mute/deafen/PTT (#12) and `ButtonController` deduplicates edges
+  within an 80 ms `_dedupWindow` against Flutter's `HardwareKeyboard`. On
+  Android/iOS, `"captureMediaButtons"` scopes active media-session capture to
+  when media bindings are configured.
 
 ### A vendored dylib must be called what its install name says
 
@@ -734,16 +800,18 @@ That shipped: the classifier dylib is distributed as
 
 **CI cannot see this class of fault.** The macOS job compiles, signs and
 uploads without ever launching the result, so the first thing that noticed was a
-crash report from a real Mac. `app/test/macos_tflite_dylib_test.dart` reads the
-Mach-O header and asserts the three names agree, which is checkable from any
-host.
+crash report from a real Mac. Historically `app/test/macos_tflite_dylib_test.dart`
+checked the Mach-O header against the podspec and loader names (removed alongside
+the unused TFLite/YAMNet runtime, assets, and Windows DLL in #25; keep the
+rule for any future native `vendored_libraries` dependency).
 
 ## Say when a device is not accelerating
 
 Anything that runs a model has to report, on every platform, whether the
 accelerated path was actually built — and say so where a rider can see it, with
-the measured per-frame cost beside it. Two of these are shipped and one is
-queued (`docs/ENHANCER_GPU.md`).
+the measured per-frame cost beside it (historically two paths shipped and one was
+queued in `docs/ENHANCER_GPU.md`; the unused TFLite/YAMNet classifier was later
+removed in #25).
 
 **Claim only what is checkable.** Core ML decides per operation whether to use
 the Neural Engine, the GPU or the CPU and reports none of it, so the honest
@@ -881,9 +949,12 @@ enough to apply again:
   silently does nothing until the next restart.
 - **`copyWith` needs an explicit `clearX` flag** for anything nullable, or
   "unchanged" and "cleared" are the same call.
-- **One secret per entry reaches the keystore; a second stays in the clear.** The
-  sync machinery lifts exactly one, so an extra per-entry secret left inline
-  travels to iCloud and Android Backup unencrypted.
+- **One synced secret per entry reaches iCloud Keychain; local secrets belong in
+  `SecretStore` (`mumbleway/secrets`).** The iCloud `CloudStore` sync machinery
+  lifts one synced password per entry, whereas local server and proxy
+  passwords now live in `SecretStore` (Android Keystore + `noBackupFilesDir`,
+  Apple local Keychain, Windows DPAPI) so they never rest in `SharedPreferences`
+  or Android Backup / iCloud sync by accident (#23).
 - **Do not nest a second timeout budget inside an existing one.** A silent peer
   would otherwise hold an attempt for longer than the reconnect backoff and the
   silence rule were tuned for.

@@ -210,7 +210,7 @@ class MainFlutterWindow: NSWindow {
           EventParamName(kEventParamDirectObject),
           EventParamType(typeEventHotKeyID),
           nil,
-          ByteCount(MemoryLayout<EventHotKeyID>.size),
+          MemoryLayout<EventHotKeyID>.size,
           nil,
           &hotKeyID)
         guard err == noErr,
@@ -231,7 +231,7 @@ class MainFlutterWindow: NSWindow {
         }
         return OSStatus(eventNotHandledErr)
       },
-      ItemCount(eventTypes.count),
+      eventTypes.count,
       &eventTypes,
       Unmanaged.passUnretained(self).toOpaque(),
       &hotKeyHandlerRef)
